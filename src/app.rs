@@ -1414,6 +1414,252 @@ impl App {
         }
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // CLI Arguments Handler
+    // ------------------------------------------------------------------------
+
+    pub fn handle_cli_args(&mut self, args: &[String]) {
+        let filtered_args: Vec<String> = args
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .collect();
+
+        if filtered_args.is_empty() {
+            return;
+        }
+
+        let auto_play = args.iter().any(|a| a == "--play" || a == "-p" || a == "--auto");
+        let first = &filtered_args[0].to_lowercase();
+
+        match first.as_str() {
+            "continue" | "history" => {
+                self.switch_mode(AppMode::History);
+            }
+            "iptv" | "live" => {
+                self.switch_mode(AppMode::LiveTv);
+                if filtered_args.len() > 1 {
+                    self.iptv_query = filtered_args[1..].join(" ");
+                }
+            }
+            "archive" => {
+                self.switch_mode(AppMode::Archive);
+                if filtered_args.len() > 1 {
+                    self.archive_query = filtered_args[1..].join(" ");
+                    self.search_archive();
+                }
+            }
+            "anime" => {
+                self.switch_mode(AppMode::Anime);
+                if filtered_args.len() > 1 {
+                    let (title, _, ep) = parse_title_season_episode(&filtered_args[1..]);
+                    self.anime_query = title;
+                    if let Some(e) = ep {
+                        self.anime_episode = e;
+                    }
+                    if let Ok(results) = crate::sources::anime::search_anime(&self.anime_query) {
+                        if !results.is_empty() {
+                            self.anime_results = results;
+                            self.anime_idx = 0;
+                            self.anime_state.select(Some(0));
+                            self.prepare_load_anime_sources();
+                            self.execute_load_anime_sources();
+                            if auto_play && !self.anime_sources.is_empty() {
+                                let _ = self.play_selected_anime_source();
+                            }
+                        }
+                    }
+                }
+            }
+            "cartoon" | "cartoons" => {
+                self.switch_mode(AppMode::Cartoons);
+                if filtered_args.len() > 1 {
+                    let (title, s, ep) = parse_title_season_episode(&filtered_args[1..]);
+                    self.cartoon_query = title;
+                    if let Some(season) = s {
+                        self.cartoon_season = season;
+                    }
+                    if let Some(episode) = ep {
+                        self.cartoon_episode = episode;
+                    }
+                    if let Ok(results) = crate::sources::cartoon::search_cartoons(&self.cartoon_query) {
+                        if !results.is_empty() {
+                            self.cartoon_results = results;
+                            self.cartoon_idx = 0;
+                            self.cartoon_state.select(Some(0));
+                            self.prepare_load_cartoon_sources();
+                            self.execute_load_cartoon_sources();
+                            if auto_play && !self.cartoon_sources.is_empty() {
+                                let _ = self.play_selected_cartoon_source();
+                            }
+                        }
+                    }
+                }
+            }
+            "tv" | "series" => {
+                self.switch_mode(AppMode::MoviesAndSeries);
+                if filtered_args.len() > 1 {
+                    let (title, s, ep) = parse_title_season_episode(&filtered_args[1..]);
+                    self.query = title;
+                    if let Some(season) = s {
+                        self.season = season;
+                    }
+                    if let Some(episode) = ep {
+                        self.episode = episode;
+                    }
+                    if let Ok(results) = crate::sources::search_title(&self.query) {
+                        if !results.is_empty() {
+                            self.results = results;
+                            self.show_idx = 0;
+                            self.show_state.select(Some(0));
+                            self.prepare_load_sources();
+                            self.execute_load_sources();
+                            if auto_play && !self.sources.is_empty() {
+                                let _ = self.play_selected_source();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // General query, e.g. "The Mentalist" 1 8 or "The Mentalist Season 1 Episode 8"
+                self.switch_mode(AppMode::MoviesAndSeries);
+                let (title, s, ep) = parse_title_season_episode(&filtered_args);
+                self.query = title;
+                if let Some(season) = s {
+                    self.season = season;
+                }
+                if let Some(episode) = ep {
+                    self.episode = episode;
+                }
+                if let Ok(results) = crate::sources::search_title(&self.query) {
+                    if !results.is_empty() {
+                        self.results = results;
+                        self.show_idx = 0;
+                        self.show_state.select(Some(0));
+                        let is_series = self.results[0].is_series();
+                        if is_series || s.is_some() || ep.is_some() {
+                            self.prepare_load_sources();
+                            self.execute_load_sources();
+                            if auto_play && !self.sources.is_empty() {
+                                let _ = self.play_selected_source();
+                            }
+                        } else {
+                            self.select_show_confirm();
+                            self.execute_load_sources();
+                            if auto_play && !self.sources.is_empty() {
+                                let _ = self.play_selected_source();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn parse_number(s: &str) -> Option<u32> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Some(n);
+    }
+    match s.to_lowercase().as_str() {
+        "one" | "first" => Some(1),
+        "two" | "second" => Some(2),
+        "three" | "third" => Some(3),
+        "four" | "fourth" => Some(4),
+        "five" | "fifth" => Some(5),
+        "six" | "sixth" => Some(6),
+        "seven" | "seventh" => Some(7),
+        "eight" | "eighth" => Some(8),
+        "nine" | "ninth" => Some(9),
+        "ten" | "tenth" => Some(10),
+        "eleven" => Some(11),
+        "twelve" => Some(12),
+        "thirteen" => Some(13),
+        "fourteen" => Some(14),
+        "fifteen" => Some(15),
+        "sixteen" => Some(16),
+        "seventeen" => Some(17),
+        "eighteen" => Some(18),
+        "nineteen" => Some(19),
+        "twenty" => Some(20),
+        _ => None,
+    }
+}
+
+pub fn parse_title_season_episode(args: &[String]) -> (String, Option<u32>, Option<u32>) {
+    let joined = args.join(" ");
+    let words: Vec<&str> = joined.split_whitespace().collect();
+    if words.is_empty() {
+        return (String::new(), None, None);
+    }
+
+    // 1. Check words for SxxExx like "S01E08" or "s1e8"
+    for (idx, word) in words.iter().enumerate() {
+        let w = word.to_lowercase();
+        if w.starts_with('s') {
+            if let Some(e_idx) = w.find('e') {
+                let s_part = &w[1..e_idx];
+                let e_part = &w[e_idx + 1..];
+                if let (Some(s_num), Some(e_num)) = (parse_number(s_part), parse_number(e_part)) {
+                    let title = words[..idx].join(" ");
+                    if !title.is_empty() {
+                        return (title, Some(s_num), Some(e_num));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check for "season X" and/or "episode Y" anywhere in words
+    let mut title_words = Vec::new();
+    let mut season_val = None;
+    let mut episode_val = None;
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].to_lowercase();
+        if (w == "season" || w == "s") && i + 1 < words.len() {
+            if let Some(num) = parse_number(words[i + 1]) {
+                season_val = Some(num);
+                i += 2;
+                continue;
+            }
+        }
+        if (w == "episode" || w == "ep" || w == "e") && i + 1 < words.len() {
+            if let Some(num) = parse_number(words[i + 1]) {
+                episode_val = Some(num);
+                i += 2;
+                continue;
+            }
+        }
+        title_words.push(words[i]);
+        i += 1;
+    }
+
+    if season_val.is_some() || episode_val.is_some() {
+        let title = title_words.join(" ");
+        return (title, season_val, episode_val);
+    }
+
+    // 3. Check trailing numbers: [title..., season, episode]
+    let len = words.len();
+    if len >= 3 {
+        if let (Some(s), Some(e)) = (parse_number(words[len - 2]), parse_number(words[len - 1])) {
+            let title = words[..len - 2].join(" ");
+            return (title, Some(s), Some(e));
+        }
+    }
+
+    // 4. Check trailing single number: [title..., episode]
+    if len >= 2 {
+        if let Some(e) = parse_number(words[len - 1]) {
+            let title = words[..len - 1].join(" ");
+            return (title, None, Some(e));
+        }
+    }
+
+    (words.join(" "), None, None)
 }
 
 impl Default for App {

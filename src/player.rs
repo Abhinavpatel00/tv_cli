@@ -12,6 +12,9 @@ const SSS: &str = "/home/lk/webseries/sss.txt";
 const OPENSUBS: &str = "https://opensubtitles-v3.strem.io/subtitles";
 
 pub fn get_history_file_path() -> PathBuf {
+    if let Ok(path) = env::var("TSSS_HISTORY_FILE") {
+        return PathBuf::from(path);
+    }
     let base = env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

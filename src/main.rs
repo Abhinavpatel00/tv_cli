@@ -31,7 +31,34 @@ use ratatui::Terminal;
 use std::io;
 use std::time::Duration;
 
+fn print_cli_help() {
+    println!("tsss-tui - Modern Interactive TUI Media Streamer\n");
+    println!("USAGE:");
+    println!("  tsss-tui                                 Launch interactive TUI home");
+    println!("  tsss-tui <title> [season] [episode]      Open TV show / movie directly (e.g. tsss-tui \"The Mentalist\" 1 8)");
+    println!("  tsss-tui <title> [s] [e] --play          Auto-stream top source directly in MPV");
+    println!("  tsss-tui tv <title> [season] [episode]   Force TV series mode");
+    println!("  tsss-tui anime <title> [episode]         Anime streaming mode (Kitsu / Nyaa)");
+    println!("  tsss-tui cartoon <title> [s] [episode]   Cartoons & Animation mode (TVMaze / Torrentio)");
+    println!("  tsss-tui iptv [keyword]                  Live TV IPTV mode");
+    println!("  tsss-tui archive <keyword>               Internet Archive public-domain cinema");
+    println!("  tsss-tui continue | history              Open Continue Watching dashboard\n");
+    println!("EXAMPLES:");
+    println!("  tsss-tui \"The Mentalist\" 1 8");
+    println!("  tsss-tui \"The Mentalist\" 1 8 --play");
+    println!("  tsss-tui anime \"Frieren\" 5");
+    println!("  tsss-tui cartoon \"Avatar\" 1 8");
+    println!("  tsss-tui iptv news");
+}
+
 fn main() -> io::Result<()> {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    if raw_args.iter().any(|a| a == "-h" || a == "--help") {
+        print_cli_help();
+        return Ok(());
+    }
+
     let mut app = App::new();
 
     enable_raw_mode()?;
@@ -39,6 +66,8 @@ fn main() -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    app.handle_cli_args(&raw_args);
 
     let mut exit = false;
 
@@ -1628,6 +1657,7 @@ https://stream.example.com/sky_cinema.m3u8
 
     #[test]
     fn test_app_record_history_mru() {
+        std::env::set_var("TSSS_HISTORY_FILE", "/tmp/tsss_test_history.json");
         let mut app = App::new();
         app.history.clear();
 
@@ -1685,5 +1715,40 @@ https://stream.example.com/sky_cinema.m3u8
         // Clear all
         app.clear_history();
         assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn test_parse_title_season_episode_variants() {
+        use crate::app::parse_title_season_episode;
+
+        // Numeric arguments
+        let (t1, s1, e1) = parse_title_season_episode(&["The Mentalist".to_string(), "1".to_string(), "8".to_string()]);
+        assert_eq!(t1, "The Mentalist");
+        assert_eq!(s1, Some(1));
+        assert_eq!(e1, Some(8));
+
+        // Word arguments like "season one episode eight"
+        let (t2, s2, e2) = parse_title_season_episode(&[
+            "mentalist".to_string(),
+            "season".to_string(),
+            "one".to_string(),
+            "episode".to_string(),
+            "eight".to_string(),
+        ]);
+        assert_eq!(t2, "mentalist");
+        assert_eq!(s2, Some(1));
+        assert_eq!(e2, Some(8));
+
+        // S01E08 pattern
+        let (t3, s3, e3) = parse_title_season_episode(&["The Mentalist S01E08".to_string()]);
+        assert_eq!(t3, "The Mentalist");
+        assert_eq!(s3, Some(1));
+        assert_eq!(e3, Some(8));
+
+        // Anime episode pattern
+        let (t4, s4, e4) = parse_title_season_episode(&["Frieren".to_string(), "5".to_string()]);
+        assert_eq!(t4, "Frieren");
+        assert_eq!(s4, None);
+        assert_eq!(e4, Some(5));
     }
 }
