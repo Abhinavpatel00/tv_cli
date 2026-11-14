@@ -1,1338 +1,35 @@
 //! tsss-tui - Modern, ergonomic interactive TUI for sss (Super Simple Streamer)
 //!
 //! Features:
+//! - Multi-Source Aggregation: Torrentio, The Pirate Bay (Apibay), and Torrents-CSV
+//! - Live TV (IPTV) Streaming: 11,000+ live television channels with category filtering
+//! - Internet Archive (Archive.org): Public-domain feature films, cult cinema & direct MP4 streams
+//! - Direct Stream Player: Stream any Magnet link (BTIH) or HLS / MP4 stream directly in MPV
 //! - Full keyboard navigation (Arrows, vi keys j/k/h/l, Tab, 1-9 direct selection)
 //! - Smart flow: Movies skip season/episode directly to sources; TV shows get an intuitive stepper
-//! - Real-time loading indicators for network/source fetching
-//! - Rich 2-column layout with Show Details & Source Inspector
-//! - Source health badges (Seeders, Quality, Resolution, HDR, Size)
-//! - Quality quick-filters (All, 4K, 1080p, 720p)
+//! - Source health badges (Seeders, Quality, Resolution, HDR, Size, Provider)
+//! - Quality quick-filters (All, 4K, 1080p, 720p, 480p)
+//! - Provider quick-filters (All, Torrentio, The Pirate Bay, Torrents-CSV)
+//! - Sort controls: By Seeders, By Quality, By Size
 //! - Continuous playback & Binge-watching support: 'n' for next episode without restarting!
 
+pub mod app;
+pub mod models;
+pub mod player;
+pub mod sources;
+pub mod ui;
+
+use app::App;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
-};
-use serde::Deserialize;
-use std::collections::HashSet;
-use std::env;
+use models::{AppMode, QualityFilter, ProviderFilter, Screen, SortOrder, StepperField};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use std::io;
-use std::process::Command;
 use std::time::Duration;
-
-const SSS: &str = "/home/lk/webseries/sss.txt";
-const IMDB_SUG: &str = "https://v3.sg.media-imdb.com/suggestion/x/{}.json";
-
-#[derive(Deserialize, Debug, Clone)]
-struct ImdbResult {
-    id: String,
-    q: Option<String>,
-    qid: Option<String>,
-    y: Option<serde_json::Value>,
-    l: Option<String>,
-    s: Option<String>,      // Starring cast
-    rank: Option<u64>,     // Popularity rank
-}
-
-impl ImdbResult {
-    fn is_series(&self) -> bool {
-        let qid = (self.qid.clone().unwrap_or_default()
-            + " "
-            + &self.q.clone().unwrap_or_default())
-        .to_lowercase();
-        qid.contains("series") || qid.contains("tv")
-    }
-
-    fn year_str(&self) -> String {
-        match &self.y {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(serde_json::Value::Number(n)) => n.to_string(),
-            _ => "----".to_string(),
-        }
-    }
-
-    fn kind_label(&self) -> &'static str {
-        if self.is_series() {
-            "TV Series"
-        } else {
-            "Movie"
-        }
-    }
-}
-
-#[derive(Deserialize, Debug)]
-struct ImdbResponse {
-    d: Option<Vec<ImdbResult>>,
-}
-
-#[derive(Clone, Debug)]
-struct SourceItem {
-    num: String,
-    provider: String,
-    resolution: String,
-    hdr_info: Option<String>,
-    seeds: Option<u32>,
-    size_str: String,
-    title: String,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum QualityFilter {
-    All,
-    Res4k,
-    Res1080p,
-    Res720p,
-}
-
-impl QualityFilter {
-    fn label(&self) -> &'static str {
-        match self {
-            QualityFilter::All => "All",
-            QualityFilter::Res4k => "4K",
-            QualityFilter::Res1080p => "1080p",
-            QualityFilter::Res720p => "720p",
-        }
-    }
-
-    fn matches(&self, item: &SourceItem) -> bool {
-        match self {
-            QualityFilter::All => true,
-            QualityFilter::Res4k => item.resolution == "4K",
-            QualityFilter::Res1080p => item.resolution == "1080p",
-            QualityFilter::Res720p => item.resolution == "720p",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StepperField {
-    Season,
-    Episode,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Screen {
-    Search,
-    PickShow,
-    SeasonEpisode,
-    PickSource,
-}
-
-struct App {
-    screen: Screen,
-    query: String,
-    results: Vec<ImdbResult>,
-    show_idx: usize,
-    show_state: ListState,
-    season: u32,
-    episode: u32,
-    stepper_field: StepperField,
-    sources: Vec<SourceItem>,
-    src_idx: usize,
-    src_state: ListState,
-    quality_filter: QualityFilter,
-    status_msg: Option<String>,
-    error: Option<String>,
-    is_loading: bool,
-    loading_msg: String,
-}
-
-impl App {
-    fn new() -> Self {
-        App {
-            screen: Screen::Search,
-            query: String::new(),
-            results: Vec::new(),
-            show_idx: 0,
-            show_state: ListState::default(),
-            season: 1,
-            episode: 1,
-            stepper_field: StepperField::Season,
-            sources: Vec::new(),
-            src_idx: 0,
-            src_state: ListState::default(),
-            quality_filter: QualityFilter::All,
-            status_msg: None,
-            error: None,
-            is_loading: false,
-            loading_msg: String::new(),
-        }
-    }
-
-    fn search(&mut self) {
-        let q = self.query.trim().to_string();
-        if q.is_empty() {
-            self.status_msg = Some("Please type a search query first".to_string());
-            return;
-        }
-
-        self.is_loading = true;
-        self.loading_msg = format!("Searching IMDb for \"{}\"...", q);
-    }
-
-    fn execute_search(&mut self) {
-        let q = self.query.trim().to_string();
-        self.is_loading = false;
-        self.results.clear();
-        self.show_idx = 0;
-        self.show_state = ListState::default();
-
-        match search_title(&q) {
-            Ok(r) => {
-                self.results = r;
-                if !self.results.is_empty() {
-                    self.show_state.select(Some(0));
-                }
-                self.screen = Screen::PickShow;
-                self.status_msg = None;
-            }
-            Err(e) => {
-                self.error = Some(format!("Search error: {e}"));
-            }
-        }
-    }
-
-    fn selected_show(&self) -> Option<&ImdbResult> {
-        self.results.get(self.show_idx)
-    }
-
-    fn select_show_confirm(&mut self) {
-        let show = match self.selected_show() {
-            Some(s) => s.clone(),
-            None => return,
-        };
-
-        if show.is_series() {
-            // For series, prompt for Season and Episode
-            self.stepper_field = StepperField::Season;
-            self.screen = Screen::SeasonEpisode;
-            self.status_msg = None;
-        } else {
-            // For movies, bypass Season/Episode screen directly to sources!
-            self.season = 1;
-            self.episode = 1;
-            self.is_loading = true;
-            let title = show.l.as_deref().unwrap_or("Movie");
-            self.loading_msg = format!("Fetching sources for {}...", title);
-        }
-    }
-
-    fn prepare_load_sources(&mut self) {
-        let show = match self.selected_show() {
-            Some(s) => s.clone(),
-            None => return,
-        };
-        let title = show.l.as_deref().unwrap_or("Title");
-        let is_tv = show.is_series();
-        self.is_loading = true;
-        if is_tv {
-            self.loading_msg = format!(
-                "Fetching sources for {} S{:02}E{:02}...",
-                title, self.season, self.episode
-            );
-        } else {
-            self.loading_msg = format!("Fetching sources for {}...", title);
-        }
-    }
-
-    fn execute_load_sources(&mut self) {
-        self.is_loading = false;
-        let show = match self.selected_show() {
-            Some(s) => s.clone(),
-            None => return,
-        };
-
-        let ep_info = if show.is_series() {
-            Some((self.season, self.episode))
-        } else {
-            None
-        };
-
-        match list_sources(&show.id, ep_info) {
-            Ok(s) => {
-                self.sources = s;
-                self.quality_filter = QualityFilter::All;
-                self.src_idx = 0;
-                self.src_state = ListState::default();
-                if !self.sources.is_empty() {
-                    self.src_state.select(Some(0));
-                }
-                self.screen = Screen::PickSource;
-                if self.sources.is_empty() {
-                    self.status_msg = Some("No sources found for this title".to_string());
-                } else {
-                    self.status_msg = None;
-                }
-            }
-            Err(e) => {
-                self.error = Some(format!("Sources error: {e}"));
-            }
-        }
-    }
-
-    fn filtered_source_indices(&self) -> Vec<usize> {
-        self.sources
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| self.quality_filter.matches(item))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    fn play_selected(&mut self) -> io::Result<()> {
-        let show = match self.selected_show() {
-            Some(s) => s.clone(),
-            None => return Ok(()),
-        };
-
-        let filtered = self.filtered_source_indices();
-        let actual_idx = match filtered.get(self.src_idx) {
-            Some(&idx) => idx,
-            None => return Ok(()),
-        };
-        let src = match self.sources.get(actual_idx) {
-            Some(s) => s.clone(),
-            None => return Ok(()),
-        };
-
-        let mut env_vars = env::vars().collect::<std::collections::HashMap<_, _>>();
-        env_vars.insert("SSS_PICK".to_string(), src.num.clone());
-        env_vars.insert(
-            "SSS_TORRENT_WAIT".to_string(),
-            env::var("SSS_TORRENT_WAIT").unwrap_or_else(|_| "90".to_string()),
-        );
-
-        // Leave alternate screen & raw mode before launching player
-        disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
-
-        let sss_path = env::var("SSS_PATH").unwrap_or_else(|_| SSS.to_string());
-        let mut cmd = Command::new(&sss_path);
-        cmd.arg("id").arg(&show.id);
-
-        let is_tv = show.is_series();
-        if is_tv {
-            cmd.arg(self.season.to_string()).arg(self.episode.to_string());
-        }
-        cmd.arg("-p").arg("mpv").envs(env_vars);
-
-        let status = cmd.status();
-
-        // Restore alternate screen & raw mode
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
-
-        match status {
-            Ok(s) => {
-                if !s.success() {
-                    self.error = Some(format!("Player exited with status: {s}"));
-                } else {
-                    let title = show.l.as_deref().unwrap_or("Title");
-                    if is_tv {
-                        self.status_msg = Some(format!(
-                            "Playback finished: {} S{:02}E{:02}. Press [N] for Next Episode!",
-                            title, self.season, self.episode
-                        ));
-                    } else {
-                        self.status_msg = Some(format!(
-                            "Playback finished: {}. [Enter] to replay, [Esc] to go back.",
-                            title
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                self.error = Some(format!("Failed to launch player: {e}"));
-            }
-        }
-        Ok(())
-    }
-
-    fn next_episode(&mut self) {
-        let is_series = self.selected_show().map_or(false, |s| s.is_series());
-        if !is_series {
-            return;
-        }
-        self.episode = self.episode.saturating_add(1);
-        self.prepare_load_sources();
-    }
-}
-
-fn search_title(q: &str) -> Result<Vec<ImdbResult>, Box<dyn std::error::Error>> {
-    let encoded = urlencoding::encode(q.trim());
-    let url = IMDB_SUG.replace("{}", &encoded);
-    let text = ureq::get(&url)
-        .set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-        .timeout(Duration::from_secs(10))
-        .call()?
-        .into_string()?;
-    let resp: ImdbResponse = serde_json::from_str(&text)?;
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    if let Some(d) = resp.d {
-        for r in d {
-            if !r.id.starts_with("tt") {
-                continue;
-            }
-            let qid = (r.qid.clone().unwrap_or_default()
-                + " "
-                + &r.q.clone().unwrap_or_default())
-            .to_lowercase();
-            if qid.contains("video")
-                || qid.contains("short")
-                || qid.contains("videogame")
-                || qid.contains("podcastseries")
-            {
-                continue;
-            }
-            if seen.contains(&r.id) {
-                continue;
-            }
-            seen.insert(r.id.clone());
-            out.push(r);
-        }
-    }
-    Ok(out)
-}
-
-fn parse_source_line(line: &str) -> Option<SourceItem> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let (num_part, rest) = line.split_once('.')?;
-    let num_part = num_part.trim();
-    if !num_part.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-
-    let rest = rest.trim();
-    let parts: Vec<&str> = rest.split('|').map(|s| s.trim()).collect();
-
-    let mut provider = "Torrentio".to_string();
-    let mut resolution = "Other".to_string();
-    let mut hdr_info = None;
-    let mut seeds = None;
-    let mut size_str = "N/A".to_string();
-    let mut title = rest.to_string();
-
-    if parts.len() >= 3 {
-        let p0 = parts[0];
-        let p0_lower = p0.to_lowercase();
-        if p0_lower.contains("torrentio") {
-            provider = "Torrentio".to_string();
-        }
-
-        if p0_lower.contains("4k") || p0_lower.contains("2160p") {
-            resolution = "4K".to_string();
-        } else if p0_lower.contains("1080p") {
-            resolution = "1080p".to_string();
-        } else if p0_lower.contains("720p") {
-            resolution = "720p".to_string();
-        } else if p0_lower.contains("480p") {
-            resolution = "480p".to_string();
-        } else if p0_lower.contains("hdtv") {
-            resolution = "HDTV".to_string();
-        } else if p0_lower.contains("dvd") {
-            resolution = "DVD".to_string();
-        } else if p0_lower.contains("bdrip") {
-            resolution = "BDRip".to_string();
-        }
-
-        if p0_lower.contains("dv") || p0_lower.contains("hdr") {
-            hdr_info = Some("DV/HDR".to_string());
-        }
-
-        for part in &parts {
-            let pl = part.to_lowercase();
-            if pl.starts_with("seed:") {
-                let s_str = pl.trim_start_matches("seed:").trim();
-                seeds = s_str.parse::<u32>().ok();
-            } else if pl.contains("gb") || pl.contains("mb") {
-                size_str = part.to_string();
-            } else if pl == "hdr" || pl == "dv" || pl.contains("hdr") || pl.contains("dv") {
-                hdr_info = Some(part.to_string());
-            }
-        }
-
-        if let Some(last) = parts.last() {
-            if !last.starts_with("seed:") && !last.contains("GB") && !last.contains("MB") {
-                title = last.to_string();
-            }
-        }
-    }
-
-    Some(SourceItem {
-        num: num_part.to_string(),
-        provider,
-        resolution,
-        hdr_info,
-        seeds,
-        size_str,
-        title,
-    })
-}
-
-fn list_sources(
-    ttid: &str,
-    episode_info: Option<(u32, u32)>,
-) -> Result<Vec<SourceItem>, String> {
-    let sss_path = env::var("SSS_PATH").unwrap_or_else(|_| SSS.to_string());
-    let mut cmd = Command::new(&sss_path);
-    cmd.arg("id").arg(ttid);
-
-    if let Some((season, episode)) = episode_info {
-        cmd.arg(season.to_string()).arg(episode.to_string());
-    }
-    cmd.arg("--list").arg("--no-subs");
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to execute {sss_path}: {e}"))?;
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut srcs = Vec::new();
-    for line in text.lines() {
-        if let Some(item) = parse_source_line(line) {
-            srcs.push(item);
-        }
-    }
-    Ok(srcs)
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-// ----------------------------------------------------------------------------
-// UI Rendering
-// ----------------------------------------------------------------------------
-
-fn ui(f: &mut Frame, app: &App) {
-    let size = f.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header & Breadcrumbs
-            Constraint::Min(0),    // Main workspace
-            Constraint::Length(3), // Footer & Shortcut pills
-        ])
-        .split(size);
-
-    // --- Header ---
-    render_header(f, app, chunks[0]);
-
-    // --- Main Screen ---
-    match app.screen {
-        Screen::Search => render_search_screen(f, app, chunks[1]),
-        Screen::PickShow => render_pick_show_screen(f, app, chunks[1]),
-        Screen::SeasonEpisode => render_season_episode_screen(f, app, chunks[1]),
-        Screen::PickSource => render_pick_source_screen(f, app, chunks[1]),
-    }
-
-    // --- Footer ---
-    render_footer(f, app, chunks[2]);
-
-    // --- Status banner / toast ---
-    if let Some(status) = &app.status_msg {
-        if app.error.is_none() && !app.is_loading {
-            let toast_area = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(chunks[0].height),
-                    Constraint::Length(1),
-                    Constraint::Min(0),
-                ])
-                .split(size)[1];
-
-            let toast = Paragraph::new(Line::from(vec![
-                Span::styled(" ℹ ", Style::default().fg(Color::Black).bg(Color::Cyan).bold()),
-                Span::raw(" "),
-                Span::styled(status, Style::default().fg(Color::Cyan).bold()),
-            ]))
-            .alignment(Alignment::Center);
-            f.render_widget(toast, toast_area);
-        }
-    }
-
-    // --- Loading overlay ---
-    if app.is_loading {
-        let area = centered_rect(50, 25, size);
-        f.render_widget(Clear, area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(Span::styled(" Please Wait ", Style::default().fg(Color::Yellow).bold()));
-
-        let text = vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("⏳ ", Style::default().fg(Color::Yellow)),
-                Span::styled(&app.loading_msg, Style::default().fg(Color::White).bold()),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Connecting to media indexers...",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-
-        let p = Paragraph::new(text)
-            .block(block)
-            .alignment(Alignment::Center);
-        f.render_widget(p, area);
-    }
-
-    // --- Error popup modal ---
-    if let Some(e) = &app.error {
-        let area = centered_rect(60, 30, size);
-        f.render_widget(Clear, area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Red))
-            .title(Span::styled(" ⚠ Notice ", Style::default().fg(Color::Red).bold()));
-
-        let p = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(e.as_str(), Style::default().fg(Color::White))),
-            Line::from(""),
-            Line::from(Span::styled(
-                "[ Press any key or Esc to dismiss ]",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
-        .block(block)
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
-
-        f.render_widget(p, area);
-    }
-}
-
-fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![
-        Span::styled(" 🎬 tsss ", Style::default().fg(Color::Black).bg(Color::Cyan).bold()),
-        Span::raw(" "),
-    ];
-
-    match app.screen {
-        Screen::Search => {
-            spans.push(Span::styled("Search", Style::default().fg(Color::White).bold()));
-        }
-        Screen::PickShow => {
-            spans.push(Span::styled("Search", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(" ❯ ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled("Pick Title", Style::default().fg(Color::Cyan).bold()));
-            if let Some(show) = app.selected_show() {
-                if let Some(title) = &show.l {
-                    spans.push(Span::styled(format!(" ({title})"), Style::default().fg(Color::Gray)));
-                }
-            }
-        }
-        Screen::SeasonEpisode => {
-            spans.push(Span::styled("Pick Title", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(" ❯ ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled("Season & Episode", Style::default().fg(Color::Cyan).bold()));
-        }
-        Screen::PickSource => {
-            if let Some(show) = app.selected_show() {
-                let title = show.l.as_deref().unwrap_or("Title");
-                spans.push(Span::styled(title, Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(" ❯ ", Style::default().fg(Color::DarkGray)));
-                if show.is_series() {
-                    spans.push(Span::styled(
-                        format!("S{:02}E{:02}", app.season, app.episode),
-                        Style::default().fg(Color::Yellow).bold(),
-                    ));
-                    spans.push(Span::styled(" ❯ ", Style::default().fg(Color::DarkGray)));
-                }
-            }
-            spans.push(Span::styled(
-                format!("Sources ({})", app.sources.len()),
-                Style::default().fg(Color::Cyan).bold(),
-            ));
-        }
-    }
-
-    let header_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    let header_p = Paragraph::new(Line::from(spans)).block(header_block);
-    f.render_widget(header_p, area);
-}
-
-fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let pills = match app.screen {
-        Screen::Search => vec![
-            ("Enter", "Search"),
-            ("Type", "Query"),
-            ("Esc", "Clear / Exit"),
-        ],
-        Screen::PickShow => vec![
-            ("↑/↓, j/k", "Navigate"),
-            ("1-9", "Quick Select"),
-            ("Enter", "Confirm"),
-            ("q / Esc", "Back to Search"),
-        ],
-        Screen::SeasonEpisode => vec![
-            ("←/→", "Adjust Value"),
-            ("Tab / ↑/↓", "Switch Field"),
-            ("0-9", "Direct Type"),
-            ("Enter", "Find Sources"),
-            ("q / Esc", "Back to Shows"),
-        ],
-        Screen::PickSource => {
-            let is_series = app.selected_show().map_or(false, |s| s.is_series());
-            let mut p = vec![
-                ("↑/↓, j/k", "Navigate"),
-                ("1-9", "Select #"),
-                ("Tab / f", "Filter Quality"),
-                ("Enter", "Stream in MPV"),
-            ];
-            if is_series {
-                p.push(("n", "Next Episode"));
-            }
-            p.push(("q / Esc", "Back"));
-            p
-        }
-    };
-
-    let mut spans = Vec::new();
-    for (i, (key, desc)) in pills.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("   "));
-        }
-        spans.push(Span::styled(
-            format!(" [{key}] "),
-            Style::default().fg(Color::Black).bg(Color::DarkGray).bold(),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(*desc, Style::default().fg(Color::White)));
-    }
-
-    let footer_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    let footer_p = Paragraph::new(Line::from(spans))
-        .alignment(Alignment::Center)
-        .block(footer_block);
-    f.render_widget(footer_p, area);
-}
-
-fn render_search_screen(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // Top margin
-            Constraint::Length(3), // Search input box
-            Constraint::Length(1), // Spacing
-            Constraint::Min(0),    // Tips / Info card
-        ])
-        .split(area);
-
-    let search_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" 🔍 Search Title ", Style::default().fg(Color::Cyan).bold()));
-
-    let input_line = if app.query.is_empty() {
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "Type movie or show name (e.g. Severance, Dune, Inception, Breaking Bad)...",
-                Style::default().fg(Color::DarkGray).italic(),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(&app.query, Style::default().fg(Color::White).bold()),
-            Span::styled("▋", Style::default().fg(Color::Cyan)),
-        ])
-    };
-
-    let search_p = Paragraph::new(input_line).block(search_block);
-    f.render_widget(search_p, chunks[1]);
-
-    // Position terminal cursor right after input text
-    f.set_cursor_position((
-        chunks[1].x + 4 + (app.query.len() as u16).min(chunks[1].width.saturating_sub(6)),
-        chunks[1].y + 1,
-    ));
-
-    // Info card below search input
-    let info_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(" Features & Quick Guide ", Style::default().fg(Color::Gray)));
-
-    let tips = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  • Instant IMDb Search: ", Style::default().fg(Color::Cyan).bold()),
-            Span::raw("Find movies, TV series, mini-series and anime."),
-        ]),
-        Line::from(vec![
-            Span::styled("  • Smart Flow: ", Style::default().fg(Color::Green).bold()),
-            Span::raw("Movies stream immediately; TV series prompt for Season/Episode."),
-        ]),
-        Line::from(vec![
-            Span::styled("  • Direct P2P Stream: ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("Fast torrent streaming over HTTP directly to MPV with auto-subtitles."),
-        ]),
-        Line::from(vec![
-            Span::styled("  • Binge-watching: ", Style::default().fg(Color::Magenta).bold()),
-            Span::raw("Press 'n' anytime to jump to the next episode without restarting."),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Popular: Severance, Breaking Bad, The Matrix, Shogun, Arcane, Interstellar",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    let info_p = Paragraph::new(tips).block(info_block);
-    f.render_widget(info_p, chunks[3]);
-}
-
-fn render_pick_show_screen(f: &mut Frame, app: &App, area: Rect) {
-    if app.results.is_empty() {
-        let empty_card = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("No titles found matching \"{}\"", app.query),
-                Style::default().fg(Color::Yellow).bold(),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "• Check spelling or try a broader keyword",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "• Press [Esc] or [q] to return to search",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Results "),
-        );
-        f.render_widget(empty_card, area);
-        return;
-    }
-
-    // Split horizontally if width is sufficient (>= 80 cols)
-    let is_wide = area.width >= 80;
-    let (list_area, details_area) = if is_wide {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(area);
-        (cols[0], Some(cols[1]))
-    } else {
-        (area, None)
-    };
-
-    // Render Show List
-    let items: Vec<ListItem> = app
-        .results
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let year = r.year_str();
-            let title = r.l.as_deref().unwrap_or("Unknown Title");
-            let is_tv = r.is_series();
-
-            let kind_badge = if is_tv {
-                Span::styled(" [SERIES] ", Style::default().fg(Color::Cyan).bold())
-            } else {
-                Span::styled(" [MOVIE]  ", Style::default().fg(Color::Yellow).bold())
-            };
-
-            let num_span = Span::styled(format!("{:2}. ", i + 1), Style::default().fg(Color::DarkGray));
-            let title_span = Span::styled(title, Style::default().fg(Color::White).bold());
-            let year_span = Span::styled(format!(" ({year})"), Style::default().fg(Color::Gray));
-
-            ListItem::new(Line::from(vec![num_span, kind_badge, title_span, year_span]))
-        })
-        .collect();
-
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            format!(" Titles ({} found) ", app.results.len()),
-            Style::default().fg(Color::Cyan).bold(),
-        ));
-
-    let list = List::new(items)
-        .block(list_block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(30, 45, 65))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-
-    f.render_stateful_widget(list, list_area, &mut app.show_state.clone());
-
-    // Render Show Details Card if wide screen
-    if let Some(detail_box) = details_area {
-        let detail_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Gray))
-            .title(Span::styled(" Title Details ", Style::default().fg(Color::White).bold()));
-
-        if let Some(show) = app.selected_show() {
-            let title = show.l.as_deref().unwrap_or("Unknown");
-            let year = show.year_str();
-            let kind = show.kind_label();
-            let id = &show.id;
-            let stars = show.s.as_deref().unwrap_or("Cast details not available");
-            let rank_str = show
-                .rank
-                .map(|r| format!("#{r} on IMDb"))
-                .unwrap_or_else(|| "N/A".to_string());
-
-            let action_hint = if show.is_series() {
-                Line::from(vec![
-                    Span::styled("Action: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Press [Enter] to choose Season & Episode", Style::default().fg(Color::Cyan).bold()),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled("Action: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Press [Enter] to fetch Movie Sources directly", Style::default().fg(Color::Yellow).bold()),
-                ])
-            };
-
-            let lines = vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(title, Style::default().fg(Color::White).bold().add_modifier(Modifier::UNDERLINED)),
-                    Span::styled(format!(" ({year})"), Style::default().fg(Color::Gray)),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Type:        ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(kind, Style::default().fg(if show.is_series() { Color::Cyan } else { Color::Yellow }).bold()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Starring:    ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(stars, Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("IMDb ID:     ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(id, Style::default().fg(Color::Gray)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Popularity:  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(rank_str, Style::default().fg(Color::Green)),
-                ]),
-                Line::from(""),
-                action_hint,
-            ];
-
-            let p = Paragraph::new(lines)
-                .block(detail_block)
-                .wrap(Wrap { trim: true });
-            f.render_widget(p, detail_box);
-        } else {
-            let p = Paragraph::new("Select a title to view details").block(detail_block);
-            f.render_widget(p, detail_box);
-        }
-    }
-}
-
-fn render_season_episode_screen(f: &mut Frame, app: &App, area: Rect) {
-    let show = app.selected_show();
-    let title = show.and_then(|s| s.l.as_deref()).unwrap_or("Series");
-    let year = show.map(|s| s.year_str()).unwrap_or_else(|| "----".to_string());
-
-    let card_area = centered_rect(65, 55, area);
-
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" Season & Episode Selection ", Style::default().fg(Color::Cyan).bold()));
-
-    let inner = main_block.inner(card_area);
-    f.render_widget(main_block, card_area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // Title info
-            Constraint::Length(3), // Season stepper
-            Constraint::Length(1), // Spacing
-            Constraint::Length(3), // Episode stepper
-            Constraint::Length(2), // Preview badge
-            Constraint::Min(0),    // Control hints
-        ])
-        .split(inner);
-
-    // Show title header
-    let title_line = Paragraph::new(Line::from(vec![
-        Span::styled("Series: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(title, Style::default().fg(Color::White).bold()),
-        Span::styled(format!(" ({year})"), Style::default().fg(Color::Gray)),
-    ]))
-    .alignment(Alignment::Center);
-    f.render_widget(title_line, rows[0]);
-
-    // Season Stepper Box
-    let is_season_active = app.stepper_field == StepperField::Season;
-    let s_border_style = if is_season_active {
-        Style::default().fg(Color::Cyan).bold()
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let s_prefix = if is_season_active { "▶ " } else { "  " };
-
-    let s_box = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(s_border_style)
-        .title(Span::styled(format!("{s_prefix}Season"), s_border_style));
-
-    let s_content = Paragraph::new(Line::from(vec![
-        Span::styled("◄  ", if is_season_active { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) }),
-        Span::styled(format!("{:02}", app.season), Style::default().fg(Color::White).bold()),
-        Span::styled("  ►", if is_season_active { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) }),
-        Span::styled("   (← / → adjust, or type number)", Style::default().fg(Color::DarkGray)),
-    ]))
-    .alignment(Alignment::Center)
-    .block(s_box);
-    f.render_widget(s_content, rows[1]);
-
-    // Episode Stepper Box
-    let is_ep_active = app.stepper_field == StepperField::Episode;
-    let ep_border_style = if is_ep_active {
-        Style::default().fg(Color::Cyan).bold()
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let ep_prefix = if is_ep_active { "▶ " } else { "  " };
-
-    let ep_box = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(ep_border_style)
-        .title(Span::styled(format!("{ep_prefix}Episode"), ep_border_style));
-
-    let ep_content = Paragraph::new(Line::from(vec![
-        Span::styled("◄  ", if is_ep_active { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) }),
-        Span::styled(format!("{:02}", app.episode), Style::default().fg(Color::White).bold()),
-        Span::styled("  ►", if is_ep_active { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) }),
-        Span::styled("   (← / → adjust, or type number)", Style::default().fg(Color::DarkGray)),
-    ]))
-    .alignment(Alignment::Center)
-    .block(ep_box);
-    f.render_widget(ep_content, rows[3]);
-
-    // Preview badge
-    let preview = Paragraph::new(Line::from(vec![
-        Span::styled("Target: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("Season {}, Episode {}  (S{:02}E{:02})", app.season, app.episode, app.season, app.episode),
-            Style::default().fg(Color::Yellow).bold(),
-        ),
-    ]))
-    .alignment(Alignment::Center);
-    f.render_widget(preview, rows[4]);
-
-    // Controls explanation
-    let hints = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("[Tab / ↑ / ↓] ", Style::default().fg(Color::Cyan)),
-            Span::raw("Switch Field    "),
-            Span::styled("[← / →] ", Style::default().fg(Color::Cyan)),
-            Span::raw("Adjust    "),
-            Span::styled("[0-9] ", Style::default().fg(Color::Cyan)),
-            Span::raw("Type Number"),
-        ]),
-        Line::from(vec![
-            Span::styled("[Enter] ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("Fetch Sources     "),
-            Span::styled("[q / Esc] ", Style::default().fg(Color::DarkGray)),
-            Span::raw("Back"),
-        ]),
-    ])
-    .alignment(Alignment::Center);
-    f.render_widget(hints, rows[5]);
-}
-
-fn render_pick_source_screen(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Filter bar
-            Constraint::Min(0),    // Main sources list & detail inspector
-        ])
-        .split(area);
-
-    // --- Quality Filter Bar ---
-    let filters = [
-        QualityFilter::All,
-        QualityFilter::Res1080p,
-        QualityFilter::Res4k,
-        QualityFilter::Res720p,
-    ];
-
-    let mut filter_spans = vec![
-        Span::styled(" Filter [Tab/f]: ", Style::default().fg(Color::DarkGray)),
-    ];
-
-    for qf in filters {
-        let count = app.sources.iter().filter(|s| qf.matches(s)).count();
-        let is_active = app.quality_filter == qf;
-        let (bullet, style) = if is_active {
-            ("● ", Style::default().fg(Color::Black).bg(Color::Cyan).bold())
-        } else {
-            ("○ ", Style::default().fg(Color::Gray))
-        };
-        let label = qf.label();
-        filter_spans.push(Span::styled(format!(" [{bullet}{label} ({count})] "), style));
-        filter_spans.push(Span::raw(" "));
-    }
-
-    let filter_bar = Paragraph::new(Line::from(filter_spans))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
-    f.render_widget(filter_bar, chunks[0]);
-
-    // --- Filtered Sources List ---
-    let filtered_indices = app.filtered_source_indices();
-
-    if filtered_indices.is_empty() {
-        let (heading, hint) = if app.sources.is_empty() {
-            (
-                "No sources found for this title or episode.",
-                "Torrentio / indexers returned 0 streams. Press [Esc] to choose another title.",
-            )
-        } else {
-            (
-                "No sources match the selected quality filter.",
-                "Press [Tab], [f], or [0] to switch filter back to All sources.",
-            )
-        };
-
-        let empty_msg = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(heading, Style::default().fg(Color::Yellow).bold())),
-            Line::from(""),
-            Line::from(Span::styled(hint, Style::default().fg(Color::Cyan))),
-            Line::from(""),
-            Line::from(Span::styled("[Esc] Go back", Style::default().fg(Color::DarkGray))),
-        ])
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Sources "),
-        );
-        f.render_widget(empty_msg, chunks[1]);
-        return;
-    }
-
-    let is_wide = chunks[1].width >= 85;
-    let (list_area, details_area) = if is_wide {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(chunks[1]);
-        (cols[0], Some(cols[1]))
-    } else {
-        (chunks[1], None)
-    };
-
-    let items: Vec<ListItem> = filtered_indices
-        .iter()
-        .enumerate()
-        .map(|(display_idx, &actual_idx)| {
-            let item = &app.sources[actual_idx];
-            let num_span = Span::styled(format!("{:2}. ", display_idx + 1), Style::default().fg(Color::DarkGray));
-
-            let res_style = match item.resolution.as_str() {
-                "4K" => Style::default().fg(Color::Magenta).bold(),
-                "1080p" => Style::default().fg(Color::Green).bold(),
-                "720p" => Style::default().fg(Color::Cyan),
-                _ => Style::default().fg(Color::DarkGray),
-            };
-            let res_span = Span::styled(format!("[{:5}] ", item.resolution), res_style);
-
-            let seeds_span = match item.seeds {
-                Some(s) if s >= 100 => {
-                    Span::styled(format!("▲ {:4} seeds ", s), Style::default().fg(Color::Green))
-                }
-                Some(s) if s >= 20 => {
-                    Span::styled(format!("▲ {:4} seeds ", s), Style::default().fg(Color::Yellow))
-                }
-                Some(s) => Span::styled(format!("▲ {:4} seeds ", s), Style::default().fg(Color::Red)),
-                None => Span::styled("            ", Style::default().fg(Color::DarkGray)),
-            };
-
-            let size_span = Span::styled(format!("{:8} ", item.size_str), Style::default().fg(Color::Cyan));
-            let title_span = Span::styled(&item.title, Style::default().fg(Color::White));
-
-            ListItem::new(Line::from(vec![
-                num_span, res_span, seeds_span, size_span, title_span,
-            ]))
-        })
-        .collect();
-
-    let title_prefix = app.selected_show().and_then(|s| s.l.as_deref()).unwrap_or("Sources");
-    let ep_prefix = if app.selected_show().map_or(false, |s| s.is_series()) {
-        format!(" S{:02}E{:02}", app.season, app.episode)
-    } else {
-        String::new()
-    };
-
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            format!(" {title_prefix}{ep_prefix} - Sources ({}) ", filtered_indices.len()),
-            Style::default().fg(Color::Cyan).bold(),
-        ));
-
-    let list = List::new(items)
-        .block(list_block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(30, 45, 65))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-
-    f.render_stateful_widget(list, list_area, &mut app.src_state.clone());
-
-    // --- Source Details Inspector ---
-    if let Some(detail_box) = details_area {
-        let actual_idx = filtered_indices.get(app.src_idx).copied();
-        let selected_item = actual_idx.and_then(|idx| app.sources.get(idx));
-
-        let detail_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Gray))
-            .title(Span::styled(" Stream Inspector ", Style::default().fg(Color::White).bold()));
-
-        if let Some(item) = selected_item {
-            let seeds_text = item
-                .seeds
-                .map(|s| {
-                    if s >= 100 {
-                        format!("{s} seeders (Excellent speed)")
-                    } else if s >= 20 {
-                        format!("{s} seeders (Good speed)")
-                    } else {
-                        format!("{s} seeders (May buffer)")
-                    }
-                })
-                .unwrap_or_else(|| "Unknown peer count".to_string());
-
-            let quality_text = if let Some(hdr) = &item.hdr_info {
-                format!("{} ({hdr})", item.resolution)
-            } else {
-                item.resolution.clone()
-            };
-
-            let lines = vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Resolution: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(quality_text, Style::default().fg(Color::Green).bold()),
-                ]),
-                Line::from(vec![
-                    Span::styled("P2P Health: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(seeds_text, Style::default().fg(Color::Yellow)),
-                ]),
-                Line::from(vec![
-                    Span::styled("File Size:  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(&item.size_str, Style::default().fg(Color::Cyan)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Provider:   ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(&item.provider, Style::default().fg(Color::Gray)),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled("Release Title:", Style::default().fg(Color::DarkGray))),
-                Line::from(Span::styled(&item.title, Style::default().fg(Color::White).bold())),
-                Line::from(""),
-                Line::from(Span::styled("Subtitles: Auto-attached via OpenSubtitles", Style::default().fg(Color::DarkGray))),
-                Line::from(Span::styled("Player:    MPV / HW Acceleration", Style::default().fg(Color::DarkGray))),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "▶ Press [Enter] to stream directly",
-                    Style::default().fg(Color::Cyan).bold(),
-                )),
-            ];
-
-            let p = Paragraph::new(lines)
-                .block(detail_block)
-                .wrap(Wrap { trim: true });
-            f.render_widget(p, detail_box);
-        } else {
-            let p = Paragraph::new("No source selected").block(detail_block);
-            f.render_widget(p, detail_box);
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Main Loop & Event Handling
-// ----------------------------------------------------------------------------
 
 fn main() -> io::Result<()> {
     let mut app = App::new();
@@ -1346,285 +43,1160 @@ fn main() -> io::Result<()> {
     let mut exit = false;
 
     while !exit {
-        terminal.draw(|f| ui(f, &app))?;
+        terminal.draw(|f| ui::render_ui(f, &app))?;
 
         // If a blocking action was triggered, run it after redrawing the loading screen
         if app.is_loading {
+            app.spinner_tick = app.spinner_tick.wrapping_add(1);
             match app.screen {
                 Screen::Search => {
                     app.execute_search();
                 }
-                Screen::PickShow | Screen::SeasonEpisode => {
+                Screen::PickShow | Screen::SeasonEpisode | Screen::PickSource => {
                     app.execute_load_sources();
                 }
-                Screen::PickSource => {
-                    app.execute_load_sources();
+                Screen::AnimeSearch => {
+                    app.execute_search_anime();
+                }
+                Screen::AnimeEpisode | Screen::AnimeSources => {
+                    app.execute_load_anime_sources();
+                }
+                Screen::CartoonSearch => {
+                    app.execute_search_cartoons();
+                }
+                Screen::CartoonSeasonEpisode | Screen::CartoonSources => {
+                    app.execute_load_cartoon_sources();
+                }
+                Screen::IptvList => {
+                    app.execute_load_iptv();
+                }
+                Screen::ArchiveSearch => {
+                    app.execute_search_archive();
+                }
+                Screen::ArchiveFiles => {
+                    app.execute_load_archive_files();
+                }
+                Screen::DirectInput | Screen::History => {
+                    app.is_loading = false;
                 }
             }
             continue;
         }
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-
-            // Global Ctrl+C handler
-            if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-                break;
-            }
-
-            // Dismiss active error popup with any key
-            if app.error.is_some() {
-                app.error = None;
-                continue;
-            }
-
-            match app.screen {
-                Screen::Search => match key.code {
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.query.clear();
-                    }
-                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let trimmed = app.query.trim_end();
-                        if let Some(pos) = trimmed.rfind(' ') {
-                            app.query.truncate(pos);
-                        } else {
-                            app.query.clear();
-                        }
-                    }
-                    KeyCode::Esc => {
-                        if !app.query.is_empty() {
-                            app.query.clear();
-                        } else {
-                            exit = true;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        app.search();
-                    }
-                    KeyCode::Backspace => {
-                        app.query.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        app.query.push(c);
-                    }
-                    _ => {}
-                },
-
-                Screen::PickShow => {
-                    let total = app.results.len();
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if total > 0 {
-                                app.show_idx = app.show_idx.saturating_sub(1);
-                                app.show_state.select(Some(app.show_idx));
-                            }
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if total > 0 && app.show_idx + 1 < total {
-                                app.show_idx += 1;
-                                app.show_state.select(Some(app.show_idx));
-                            }
-                        }
-                        KeyCode::PageUp => {
-                            if total > 0 {
-                                app.show_idx = app.show_idx.saturating_sub(5);
-                                app.show_state.select(Some(app.show_idx));
-                            }
-                        }
-                        KeyCode::PageDown => {
-                            if total > 0 {
-                                app.show_idx = (app.show_idx + 5).min(total - 1);
-                                app.show_state.select(Some(app.show_idx));
-                            }
-                        }
-                        KeyCode::Home | KeyCode::Char('g') => {
-                            if total > 0 {
-                                app.show_idx = 0;
-                                app.show_state.select(Some(0));
-                            }
-                        }
-                        KeyCode::End | KeyCode::Char('G') => {
-                            if total > 0 {
-                                app.show_idx = total - 1;
-                                app.show_state.select(Some(app.show_idx));
-                            }
-                        }
-                        // Quick 1-9 selection
-                        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                            let digit_idx = (c.to_digit(10).unwrap_or(1) as usize) - 1;
-                            if digit_idx < total {
-                                app.show_idx = digit_idx;
-                                app.show_state.select(Some(app.show_idx));
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if total > 0 {
-                                app.select_show_confirm();
-                            }
-                        }
-                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
-                            app.screen = Screen::Search;
-                            app.status_msg = None;
-                        }
-                        _ => {}
-                    }
+        // Wait for next keyboard event with polling timeout for smooth UI responsiveness
+        if event::poll(Duration::from_millis(150))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
                 }
 
-                Screen::SeasonEpisode => match key.code {
-                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                        app.stepper_field = match app.stepper_field {
-                            StepperField::Season => StepperField::Episode,
-                            StepperField::Episode => StepperField::Season,
-                        };
+                // Global Ctrl+C handler
+                if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+                    break;
+                }
+
+                // Dismiss active error popup with any key
+                if app.error.is_some() {
+                    app.error = None;
+                    continue;
+                }
+
+                // Dismiss help modal with any key or Esc
+                if app.show_help {
+                    app.show_help = false;
+                    continue;
+                }
+
+                // Toggle help modal
+                if key.code == KeyCode::Char('?') && !matches!(app.screen, Screen::Search | Screen::AnimeSearch | Screen::CartoonSearch | Screen::DirectInput) {
+                    app.show_help = true;
+                    continue;
+                }
+
+                // --- Global Mode Switching Shortcuts (F1-F7 and Ctrl+1-7) ---
+                match key.code {
+                    KeyCode::F(1) => {
+                        app.switch_mode(AppMode::MoviesAndSeries);
+                        continue;
                     }
-                    KeyCode::Left | KeyCode::Char('-') => match app.stepper_field {
-                        StepperField::Season => {
-                            app.season = app.season.saturating_sub(1).max(1);
-                        }
-                        StepperField::Episode => {
-                            app.episode = app.episode.saturating_sub(1).max(1);
-                        }
-                    },
-                    KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
-                        match app.stepper_field {
-                            StepperField::Season => {
-                                app.season = (app.season + 1).min(99);
-                            }
-                            StepperField::Episode => {
-                                app.episode = (app.episode + 1).min(999);
-                            }
-                        }
+                    KeyCode::F(2) => {
+                        app.switch_mode(AppMode::Anime);
+                        continue;
                     }
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        let digit = c.to_digit(10).unwrap_or(0);
-                        match app.stepper_field {
-                            StepperField::Season => {
-                                let new_val = if app.season > 9 { digit } else { app.season * 10 + digit };
-                                app.season = new_val.clamp(1, 99);
-                            }
-                            StepperField::Episode => {
-                                let new_val = if app.episode > 99 { digit } else { app.episode * 10 + digit };
-                                app.episode = new_val.clamp(1, 999);
-                            }
-                        }
+                    KeyCode::F(3) => {
+                        app.switch_mode(AppMode::Cartoons);
+                        continue;
                     }
-                    KeyCode::Backspace => match app.stepper_field {
-                        StepperField::Season => {
-                            app.season = (app.season / 10).max(1);
-                        }
-                        StepperField::Episode => {
-                            app.episode = (app.episode / 10).max(1);
-                        }
-                    },
-                    KeyCode::Enter => {
-                        app.prepare_load_sources();
+                    KeyCode::F(4) => {
+                        app.switch_mode(AppMode::LiveTv);
+                        continue;
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        app.screen = Screen::PickShow;
-                        app.status_msg = None;
+                    KeyCode::F(5) => {
+                        app.switch_mode(AppMode::Archive);
+                        continue;
+                    }
+                    KeyCode::F(6) => {
+                        app.switch_mode(AppMode::DirectStream);
+                        continue;
+                    }
+                    KeyCode::F(7) => {
+                        app.switch_mode(AppMode::History);
+                        continue;
+                    }
+                    KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.switch_mode(AppMode::MoviesAndSeries);
+                        continue;
+                    }
+                    KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.switch_mode(AppMode::Anime);
+                        continue;
+                    }
+                    KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.switch_mode(AppMode::Cartoons);
+                        continue;
+                    }
+                    KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.switch_mode(AppMode::LiveTv);
+                        continue;
+                    }
+                    KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.switch_mode(AppMode::Archive);
+                        continue;
+                    }
+                    KeyCode::Char('6') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.switch_mode(AppMode::DirectStream);
+                        continue;
+                    }
+                    KeyCode::Char('7') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.switch_mode(AppMode::History);
+                        continue;
+                    }
+                    KeyCode::Char('H') if !matches!(app.screen, Screen::Search | Screen::AnimeSearch | Screen::CartoonSearch | Screen::DirectInput) => {
+                        app.switch_mode(AppMode::History);
+                        continue;
                     }
                     _ => {}
-                },
+                }
 
-                Screen::PickSource => {
-                    let filtered_indices = app.filtered_source_indices();
-                    let total = filtered_indices.len();
-
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if total > 0 {
-                                app.src_idx = app.src_idx.saturating_sub(1);
-                                app.src_state.select(Some(app.src_idx));
+                // Screen-specific event handling
+                match app.screen {
+                    // --------------------------------------------------------
+                    // Screen: Movies & TV Search
+                    // --------------------------------------------------------
+                    Screen::Search => match key.code {
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.query.clear();
+                        }
+                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let trimmed = app.query.trim_end();
+                            if let Some(pos) = trimmed.rfind(' ') {
+                                app.query.truncate(pos);
+                            } else {
+                                app.query.clear();
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if total > 0 && app.src_idx + 1 < total {
-                                app.src_idx += 1;
-                                app.src_state.select(Some(app.src_idx));
+                        KeyCode::Esc => {
+                            if !app.query.is_empty() {
+                                app.query.clear();
+                            } else {
+                                exit = true;
                             }
-                        }
-                        KeyCode::PageUp => {
-                            if total > 0 {
-                                app.src_idx = app.src_idx.saturating_sub(5);
-                                app.src_state.select(Some(app.src_idx));
-                            }
-                        }
-                        KeyCode::PageDown => {
-                            if total > 0 {
-                                app.src_idx = (app.src_idx + 5).min(total - 1);
-                                app.src_state.select(Some(app.src_idx));
-                            }
-                        }
-                        KeyCode::Home | KeyCode::Char('g') => {
-                            if total > 0 {
-                                app.src_idx = 0;
-                                app.src_state.select(Some(0));
-                            }
-                        }
-                        KeyCode::End | KeyCode::Char('G') => {
-                            if total > 0 {
-                                app.src_idx = total - 1;
-                                app.src_state.select(Some(app.src_idx));
-                            }
-                        }
-                        // Filter cycling: Tab, BackTab, f, F
-                        KeyCode::Tab | KeyCode::Char('f') => {
-                            app.quality_filter = match app.quality_filter {
-                                QualityFilter::All => QualityFilter::Res1080p,
-                                QualityFilter::Res1080p => QualityFilter::Res4k,
-                                QualityFilter::Res4k => QualityFilter::Res720p,
-                                QualityFilter::Res720p => QualityFilter::All,
-                            };
-                            app.src_idx = 0;
-                            app.src_state.select(Some(0));
-                        }
-                        KeyCode::BackTab | KeyCode::Char('F') => {
-                            app.quality_filter = match app.quality_filter {
-                                QualityFilter::All => QualityFilter::Res720p,
-                                QualityFilter::Res720p => QualityFilter::Res4k,
-                                QualityFilter::Res4k => QualityFilter::Res1080p,
-                                QualityFilter::Res1080p => QualityFilter::All,
-                            };
-                            app.src_idx = 0;
-                            app.src_state.select(Some(0));
-                        }
-                        // Reset filter to All: 0 or 'a'
-                        KeyCode::Char('0') | KeyCode::Char('a') | KeyCode::Char('A') => {
-                            app.quality_filter = QualityFilter::All;
-                            app.src_idx = 0;
-                            app.src_state.select(Some(0));
-                        }
-                        // Direct item selection: 1-9
-                        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                            let digit_idx = (c.to_digit(10).unwrap_or(1) as usize) - 1;
-                            if digit_idx < total {
-                                app.src_idx = digit_idx;
-                                app.src_state.select(Some(app.src_idx));
-                            }
-                        }
-                        // Binge-watching: next episode shortcut
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
-                            app.next_episode();
                         }
                         KeyCode::Enter => {
-                            if total > 0 {
-                                if let Err(e) = app.play_selected() {
-                                    app.error = Some(e.to_string());
+                            app.search();
+                        }
+                        KeyCode::Backspace => {
+                            app.query.pop();
+                        }
+                        KeyCode::Char('?') if app.query.is_empty() => {
+                            app.show_help = true;
+                        }
+                        KeyCode::Char(c) => {
+                            app.query.push(c);
+                        }
+                        _ => {}
+                    },
+
+                    // --------------------------------------------------------
+                    // Screen: Pick Show
+                    // --------------------------------------------------------
+                    Screen::PickShow => {
+                        let total = app.results.len();
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if total > 0 {
+                                    app.show_idx = app.show_idx.saturating_sub(1);
+                                    app.show_state.select(Some(app.show_idx));
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if total > 0 && app.show_idx + 1 < total {
+                                    app.show_idx += 1;
+                                    app.show_state.select(Some(app.show_idx));
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if total > 0 {
+                                    app.show_idx = app.show_idx.saturating_sub(5);
+                                    app.show_state.select(Some(app.show_idx));
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if total > 0 {
+                                    app.show_idx = (app.show_idx + 5).min(total - 1);
+                                    app.show_state.select(Some(app.show_idx));
+                                }
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                if total > 0 {
+                                    app.show_idx = 0;
+                                    app.show_state.select(Some(0));
+                                }
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                if total > 0 {
+                                    app.show_idx = total - 1;
+                                    app.show_state.select(Some(app.show_idx));
+                                }
+                            }
+                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                let digit_idx = (c.to_digit(10).unwrap_or(1) as usize) - 1;
+                                if digit_idx < total {
+                                    app.show_idx = digit_idx;
+                                    app.show_state.select(Some(app.show_idx));
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if total > 0 {
+                                    app.select_show_confirm();
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                                app.screen = Screen::Search;
+                                app.status_msg = None;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // --------------------------------------------------------
+                    // Screen: Season & Episode Stepper
+                    // --------------------------------------------------------
+                    Screen::SeasonEpisode => match key.code {
+                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                            app.stepper_field = match app.stepper_field {
+                                StepperField::Season => StepperField::Episode,
+                                StepperField::Episode => StepperField::Season,
+                            };
+                        }
+                        KeyCode::Left | KeyCode::Char('-') => match app.stepper_field {
+                            StepperField::Season => {
+                                app.season = app.season.saturating_sub(1).max(1);
+                            }
+                            StepperField::Episode => {
+                                app.episode = app.episode.saturating_sub(1).max(1);
+                            }
+                        },
+                        KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
+                            match app.stepper_field {
+                                StepperField::Season => {
+                                    app.season = (app.season + 1).min(99);
+                                }
+                                StepperField::Episode => {
+                                    app.episode = (app.episode + 1).min(999);
                                 }
                             }
                         }
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            let is_series = app.selected_show().map_or(false, |s| s.is_series());
-                            if is_series {
-                                app.screen = Screen::SeasonEpisode;
-                            } else {
-                                app.screen = Screen::PickShow;
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            let digit = c.to_digit(10).unwrap_or(0);
+                            match app.stepper_field {
+                                StepperField::Season => {
+                                    let new_val = if app.season > 9 { digit } else { app.season * 10 + digit };
+                                    app.season = new_val.clamp(1, 99);
+                                }
+                                StepperField::Episode => {
+                                    let new_val = if app.episode > 99 { digit } else { app.episode * 10 + digit };
+                                    app.episode = new_val.clamp(1, 999);
+                                }
                             }
+                        }
+                        KeyCode::Backspace => match app.stepper_field {
+                            StepperField::Season => {
+                                app.season = (app.season / 10).max(1);
+                            }
+                            StepperField::Episode => {
+                                app.episode = (app.episode / 10).max(1);
+                            }
+                        },
+                        KeyCode::Enter => {
+                            app.prepare_load_sources();
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            app.screen = Screen::PickShow;
                             app.status_msg = None;
                         }
                         _ => {}
+                    },
+
+                    // --------------------------------------------------------
+                    // Screen: Pick Source
+                    // --------------------------------------------------------
+                    Screen::PickSource => {
+                        let filtered_indices = app.filtered_source_indices();
+                        let total = filtered_indices.len();
+
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if total > 0 {
+                                    app.src_idx = app.src_idx.saturating_sub(1);
+                                    app.src_state.select(Some(app.src_idx));
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if total > 0 && app.src_idx + 1 < total {
+                                    app.src_idx += 1;
+                                    app.src_state.select(Some(app.src_idx));
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if total > 0 {
+                                    app.src_idx = app.src_idx.saturating_sub(5);
+                                    app.src_state.select(Some(app.src_idx));
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if total > 0 {
+                                    app.src_idx = (app.src_idx + 5).min(total - 1);
+                                    app.src_state.select(Some(app.src_idx));
+                                }
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                if total > 0 {
+                                    app.src_idx = 0;
+                                    app.src_state.select(Some(0));
+                                }
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                if total > 0 {
+                                    app.src_idx = total - 1;
+                                    app.src_state.select(Some(app.src_idx));
+                                }
+                            }
+                            // Quality filter cycling: Tab, f, F
+                            KeyCode::Tab | KeyCode::Char('f') => {
+                                app.quality_filter = match app.quality_filter {
+                                    QualityFilter::All => QualityFilter::Res1080p,
+                                    QualityFilter::Res1080p => QualityFilter::Res4k,
+                                    QualityFilter::Res4k => QualityFilter::Res720p,
+                                    QualityFilter::Res720p => QualityFilter::Res480p,
+                                    QualityFilter::Res480p => QualityFilter::All,
+                                };
+                                app.src_idx = 0;
+                                app.src_state.select(Some(0));
+                            }
+                            // Provider filter cycling: p, P
+                            KeyCode::Char('p') => {
+                                app.provider_filter = match app.provider_filter {
+                                    ProviderFilter::All => ProviderFilter::Torrentio,
+                                    ProviderFilter::Torrentio => ProviderFilter::ThePirateBay,
+                                    ProviderFilter::ThePirateBay => ProviderFilter::TorrentsCsv,
+                                    ProviderFilter::TorrentsCsv => ProviderFilter::All,
+                                    _ => ProviderFilter::All,
+                                };
+                                app.src_idx = 0;
+                                app.src_state.select(Some(0));
+                            }
+                            // Sort order cycling: s, S
+                            KeyCode::Char('s') => {
+                                app.sort_order = match app.sort_order {
+                                    SortOrder::Seeders => SortOrder::Quality,
+                                    SortOrder::Quality => SortOrder::Size,
+                                    SortOrder::Size => SortOrder::Seeders,
+                                };
+                                app.src_idx = 0;
+                                app.src_state.select(Some(0));
+                            }
+                            // Reset filter to All: 0 or 'a'
+                            KeyCode::Char('0') | KeyCode::Char('a') | KeyCode::Char('A') => {
+                                app.quality_filter = QualityFilter::All;
+                                app.provider_filter = ProviderFilter::All;
+                                app.src_idx = 0;
+                                app.src_state.select(Some(0));
+                            }
+                            // Quick direct selection: 1-9
+                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                let digit_idx = (c.to_digit(10).unwrap_or(1) as usize) - 1;
+                                if digit_idx < total {
+                                    app.src_idx = digit_idx;
+                                    app.src_state.select(Some(app.src_idx));
+                                }
+                            }
+                            // Binge-watching: next episode shortcut
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                app.next_episode();
+                            }
+                            // Previous episode shortcut
+                            KeyCode::Char('P') => {
+                                app.prev_episode();
+                            }
+                            KeyCode::Enter => {
+                                if total > 0 {
+                                    if let Err(e) = app.play_selected_source() {
+                                        app.error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                let is_series = app.selected_show().is_some_and(|s| s.is_series());
+                                if is_series {
+                                    app.screen = Screen::SeasonEpisode;
+                                } else {
+                                    app.screen = Screen::PickShow;
+                                }
+                                app.status_msg = None;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // --------------------------------------------------------
+                    // Screen: Anime Search & Catalog
+                    // --------------------------------------------------------
+                    Screen::AnimeSearch => match key.code {
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.anime_query.clear();
+                        }
+                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let trimmed = app.anime_query.trim_end();
+                            if let Some(pos) = trimmed.rfind(' ') {
+                                app.anime_query.truncate(pos);
+                            } else {
+                                app.anime_query.clear();
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let total = app.anime_results.len();
+                            if total > 0 {
+                                app.anime_idx = app.anime_idx.saturating_sub(1);
+                                app.anime_state.select(Some(app.anime_idx));
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let total = app.anime_results.len();
+                            if total > 0 && app.anime_idx + 1 < total {
+                                app.anime_idx += 1;
+                                app.anime_state.select(Some(app.anime_idx));
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            let total = app.anime_results.len();
+                            if total > 0 {
+                                app.anime_idx = app.anime_idx.saturating_sub(5);
+                                app.anime_state.select(Some(app.anime_idx));
+                            }
+                        }
+                        KeyCode::PageDown => {
+                            let total = app.anime_results.len();
+                            if total > 0 {
+                                app.anime_idx = (app.anime_idx + 5).min(total - 1);
+                                app.anime_state.select(Some(app.anime_idx));
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if !app.anime_results.is_empty() && app.anime_query.is_empty() {
+                                app.select_anime_confirm();
+                            } else if !app.anime_query.is_empty() {
+                                app.search_anime();
+                            } else if !app.anime_results.is_empty() {
+                                app.select_anime_confirm();
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.anime_query.pop();
+                        }
+                        KeyCode::Esc => {
+                            if !app.anime_query.is_empty() {
+                                app.anime_query.clear();
+                            } else {
+                                app.switch_mode(AppMode::MoviesAndSeries);
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            app.anime_query.push(c);
+                        }
+                        _ => {}
+                    },
+
+                    // --------------------------------------------------------
+                    // Screen: Anime Episode Selection
+                    // --------------------------------------------------------
+                    Screen::AnimeEpisode => {
+                        let max_ep = app.selected_anime().and_then(|a| a.episode_count).unwrap_or(999);
+                        match key.code {
+                            KeyCode::Left | KeyCode::Char('-') => {
+                                app.anime_episode = app.anime_episode.saturating_sub(1).max(1);
+                            }
+                            KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
+                                app.anime_episode = (app.anime_episode + 1).min(max_ep);
+                            }
+                            KeyCode::Char(c) if c.is_ascii_digit() => {
+                                let digit = c.to_digit(10).unwrap_or(0);
+                                let new_val = if app.anime_episode > 99 { digit } else { app.anime_episode * 10 + digit };
+                                app.anime_episode = new_val.clamp(1, max_ep);
+                            }
+                            KeyCode::Backspace => {
+                                app.anime_episode = (app.anime_episode / 10).max(1);
+                            }
+                            KeyCode::Enter => {
+                                app.prepare_load_anime_sources();
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.screen = Screen::AnimeSearch;
+                                app.status_msg = None;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // --------------------------------------------------------
+                    // Screen: Anime Source Selection
+                    // --------------------------------------------------------
+                    Screen::AnimeSources => {
+                        let filtered_indices = app.filtered_anime_source_indices();
+                        let total = filtered_indices.len();
+
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if total > 0 {
+                                    app.anime_src_idx = app.anime_src_idx.saturating_sub(1);
+                                    app.anime_src_state.select(Some(app.anime_src_idx));
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if total > 0 && app.anime_src_idx + 1 < total {
+                                    app.anime_src_idx += 1;
+                                    app.anime_src_state.select(Some(app.anime_src_idx));
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if total > 0 {
+                                    app.anime_src_idx = app.anime_src_idx.saturating_sub(5);
+                                    app.anime_src_state.select(Some(app.anime_src_idx));
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if total > 0 {
+                                    app.anime_src_idx = (app.anime_src_idx + 5).min(total - 1);
+                                    app.anime_src_state.select(Some(app.anime_src_idx));
+                                }
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                if total > 0 {
+                                    app.anime_src_idx = 0;
+                                    app.anime_src_state.select(Some(0));
+                                }
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                if total > 0 {
+                                    app.anime_src_idx = total - 1;
+                                    app.anime_src_state.select(Some(app.anime_src_idx));
+                                }
+                            }
+                            // Quality filter cycling: Tab, f, F
+                            KeyCode::Tab | KeyCode::Char('f') => {
+                                app.anime_quality_filter = match app.anime_quality_filter {
+                                    QualityFilter::All => QualityFilter::Res1080p,
+                                    QualityFilter::Res1080p => QualityFilter::Res4k,
+                                    QualityFilter::Res4k => QualityFilter::Res720p,
+                                    QualityFilter::Res720p => QualityFilter::Res480p,
+                                    QualityFilter::Res480p => QualityFilter::All,
+                                };
+                                app.anime_src_idx = 0;
+                                app.anime_src_state.select(Some(0));
+                            }
+                            // Provider filter cycling: p
+                            KeyCode::Char('p') => {
+                                app.anime_provider_filter = match app.anime_provider_filter {
+                                    ProviderFilter::All => ProviderFilter::NyaaSi,
+                                    ProviderFilter::NyaaSi => ProviderFilter::Torrentio,
+                                    ProviderFilter::Torrentio => ProviderFilter::ThePirateBay,
+                                    ProviderFilter::ThePirateBay => ProviderFilter::TorrentsCsv,
+                                    _ => ProviderFilter::All,
+                                };
+                                app.anime_src_idx = 0;
+                                app.anime_src_state.select(Some(0));
+                            }
+                            // Sort order cycling: s, S
+                            KeyCode::Char('s') => {
+                                app.anime_sort_order = match app.anime_sort_order {
+                                    SortOrder::Seeders => SortOrder::Quality,
+                                    SortOrder::Quality => SortOrder::Size,
+                                    SortOrder::Size => SortOrder::Seeders,
+                                };
+                                app.anime_src_idx = 0;
+                                app.anime_src_state.select(Some(0));
+                            }
+                            // Reset filter to All: 0 or 'a'
+                            KeyCode::Char('0') | KeyCode::Char('a') | KeyCode::Char('A') => {
+                                app.anime_quality_filter = QualityFilter::All;
+                                app.anime_provider_filter = ProviderFilter::All;
+                                app.anime_src_idx = 0;
+                                app.anime_src_state.select(Some(0));
+                            }
+                            // Quick direct selection: 1-9
+                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                let digit_idx = (c.to_digit(10).unwrap_or(1) as usize) - 1;
+                                if digit_idx < total {
+                                    app.anime_src_idx = digit_idx;
+                                    app.anime_src_state.select(Some(app.anime_src_idx));
+                                }
+                            }
+                            // Binge-watching: next episode shortcut
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                app.anime_next_episode();
+                            }
+                            // Previous episode shortcut
+                            KeyCode::Char('P') => {
+                                app.anime_prev_episode();
+                            }
+                            KeyCode::Enter => {
+                                if total > 0 {
+                                    if let Err(e) = app.play_selected_anime_source() {
+                                        app.error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                let is_movie = app.selected_anime().is_some_and(|a| a.is_movie());
+                                if is_movie {
+                                    app.screen = Screen::AnimeSearch;
+                                } else {
+                                    app.screen = Screen::AnimeEpisode;
+                                }
+                                app.status_msg = None;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // --------------------------------------------------------
+                    // Screen: Cartoons Search & Catalog
+                    // --------------------------------------------------------
+                    Screen::CartoonSearch => match key.code {
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.cartoon_query.clear();
+                        }
+                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let trimmed = app.cartoon_query.trim_end();
+                            if let Some(pos) = trimmed.rfind(' ') {
+                                app.cartoon_query.truncate(pos);
+                            } else {
+                                app.cartoon_query.clear();
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let total = app.cartoon_results.len();
+                            if total > 0 {
+                                app.cartoon_idx = app.cartoon_idx.saturating_sub(1);
+                                app.cartoon_state.select(Some(app.cartoon_idx));
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let total = app.cartoon_results.len();
+                            if total > 0 && app.cartoon_idx + 1 < total {
+                                app.cartoon_idx += 1;
+                                app.cartoon_state.select(Some(app.cartoon_idx));
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            let total = app.cartoon_results.len();
+                            if total > 0 {
+                                app.cartoon_idx = app.cartoon_idx.saturating_sub(5);
+                                app.cartoon_state.select(Some(app.cartoon_idx));
+                            }
+                        }
+                        KeyCode::PageDown => {
+                            let total = app.cartoon_results.len();
+                            if total > 0 {
+                                app.cartoon_idx = (app.cartoon_idx + 5).min(total - 1);
+                                app.cartoon_state.select(Some(app.cartoon_idx));
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if !app.cartoon_results.is_empty() && app.cartoon_query.is_empty() {
+                                app.select_cartoon_confirm();
+                            } else if !app.cartoon_query.is_empty() {
+                                app.search_cartoons();
+                            } else if !app.cartoon_results.is_empty() {
+                                app.select_cartoon_confirm();
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.cartoon_query.pop();
+                        }
+                        KeyCode::Esc => {
+                            if !app.cartoon_query.is_empty() {
+                                app.cartoon_query.clear();
+                            } else {
+                                app.switch_mode(AppMode::MoviesAndSeries);
+                            }
+                        }
+                        KeyCode::Char('?') if app.cartoon_query.is_empty() => {
+                            app.show_help = true;
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' && app.cartoon_query.is_empty() => {
+                            let digit_idx = (c.to_digit(10).unwrap_or(1) as usize) - 1;
+                            if digit_idx < app.cartoon_results.len() {
+                                app.cartoon_idx = digit_idx;
+                                app.cartoon_state.select(Some(app.cartoon_idx));
+                                app.select_cartoon_confirm();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            app.cartoon_query.push(c);
+                        }
+                        _ => {}
+                    },
+
+                    // --------------------------------------------------------
+                    // Screen: Cartoon Season & Episode Selection
+                    // --------------------------------------------------------
+                    Screen::CartoonSeasonEpisode => match key.code {
+                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                            app.cartoon_stepper_field = match app.cartoon_stepper_field {
+                                StepperField::Season => StepperField::Episode,
+                                StepperField::Episode => StepperField::Season,
+                            };
+                        }
+                        KeyCode::Left | KeyCode::Char('-') => match app.cartoon_stepper_field {
+                            StepperField::Season => {
+                                app.cartoon_season = app.cartoon_season.saturating_sub(1).max(1);
+                            }
+                            StepperField::Episode => {
+                                app.cartoon_episode = app.cartoon_episode.saturating_sub(1).max(1);
+                            }
+                        },
+                        KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
+                            match app.cartoon_stepper_field {
+                                StepperField::Season => {
+                                    app.cartoon_season = (app.cartoon_season + 1).min(99);
+                                }
+                                StepperField::Episode => {
+                                    app.cartoon_episode = (app.cartoon_episode + 1).min(999);
+                                }
+                            }
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            let digit = c.to_digit(10).unwrap_or(0);
+                            match app.cartoon_stepper_field {
+                                StepperField::Season => {
+                                    let new_val = if app.cartoon_season > 9 { digit } else { app.cartoon_season * 10 + digit };
+                                    app.cartoon_season = new_val.clamp(1, 99);
+                                }
+                                StepperField::Episode => {
+                                    let new_val = if app.cartoon_episode > 99 { digit } else { app.cartoon_episode * 10 + digit };
+                                    app.cartoon_episode = new_val.clamp(1, 999);
+                                }
+                            }
+                        }
+                        KeyCode::Backspace => match app.cartoon_stepper_field {
+                            StepperField::Season => {
+                                app.cartoon_season = (app.cartoon_season / 10).max(1);
+                            }
+                            StepperField::Episode => {
+                                app.cartoon_episode = (app.cartoon_episode / 10).max(1);
+                            }
+                        },
+                        KeyCode::Enter => {
+                            app.prepare_load_cartoon_sources();
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            app.screen = Screen::CartoonSearch;
+                            app.status_msg = None;
+                        }
+                        _ => {}
+                    },
+
+                    // --------------------------------------------------------
+                    // Screen: Cartoon Source Selection
+                    // --------------------------------------------------------
+                    Screen::CartoonSources => {
+                        let filtered_indices = app.filtered_cartoon_source_indices();
+                        let total = filtered_indices.len();
+
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if total > 0 {
+                                    app.cartoon_src_idx = app.cartoon_src_idx.saturating_sub(1);
+                                    app.cartoon_src_state.select(Some(app.cartoon_src_idx));
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if total > 0 && app.cartoon_src_idx + 1 < total {
+                                    app.cartoon_src_idx += 1;
+                                    app.cartoon_src_state.select(Some(app.cartoon_src_idx));
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if total > 0 {
+                                    app.cartoon_src_idx = app.cartoon_src_idx.saturating_sub(5);
+                                    app.cartoon_src_state.select(Some(app.cartoon_src_idx));
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if total > 0 {
+                                    app.cartoon_src_idx = (app.cartoon_src_idx + 5).min(total - 1);
+                                    app.cartoon_src_state.select(Some(app.cartoon_src_idx));
+                                }
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                if total > 0 {
+                                    app.cartoon_src_idx = 0;
+                                    app.cartoon_src_state.select(Some(0));
+                                }
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                if total > 0 {
+                                    app.cartoon_src_idx = total - 1;
+                                    app.cartoon_src_state.select(Some(app.cartoon_src_idx));
+                                }
+                            }
+                            // Quality filter cycling: Tab, f, F
+                            KeyCode::Tab | KeyCode::Char('f') => {
+                                app.cartoon_quality_filter = match app.cartoon_quality_filter {
+                                    QualityFilter::All => QualityFilter::Res1080p,
+                                    QualityFilter::Res1080p => QualityFilter::Res4k,
+                                    QualityFilter::Res4k => QualityFilter::Res720p,
+                                    QualityFilter::Res720p => QualityFilter::Res480p,
+                                    QualityFilter::Res480p => QualityFilter::All,
+                                };
+                                app.cartoon_src_idx = 0;
+                                app.cartoon_src_state.select(Some(0));
+                            }
+                            // Provider filter cycling: p
+                            KeyCode::Char('p') => {
+                                app.cartoon_provider_filter = match app.cartoon_provider_filter {
+                                    ProviderFilter::All => ProviderFilter::Torrentio,
+                                    ProviderFilter::Torrentio => ProviderFilter::ThePirateBay,
+                                    ProviderFilter::ThePirateBay => ProviderFilter::TorrentsCsv,
+                                    ProviderFilter::TorrentsCsv => ProviderFilter::NyaaSi,
+                                    _ => ProviderFilter::All,
+                                };
+                                app.cartoon_src_idx = 0;
+                                app.cartoon_src_state.select(Some(0));
+                            }
+                            // Sort order cycling: s, S
+                            KeyCode::Char('s') => {
+                                app.cartoon_sort_order = match app.cartoon_sort_order {
+                                    SortOrder::Seeders => SortOrder::Quality,
+                                    SortOrder::Quality => SortOrder::Size,
+                                    SortOrder::Size => SortOrder::Seeders,
+                                };
+                                app.cartoon_src_idx = 0;
+                                app.cartoon_src_state.select(Some(0));
+                            }
+                            // Reset filter to All: 0 or 'a'
+                            KeyCode::Char('0') | KeyCode::Char('a') | KeyCode::Char('A') => {
+                                app.cartoon_quality_filter = QualityFilter::All;
+                                app.cartoon_provider_filter = ProviderFilter::All;
+                                app.cartoon_src_idx = 0;
+                                app.cartoon_src_state.select(Some(0));
+                            }
+                            // Quick direct selection: 1-9
+                            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                let digit_idx = (c.to_digit(10).unwrap_or(1) as usize) - 1;
+                                if digit_idx < total {
+                                    app.cartoon_src_idx = digit_idx;
+                                    app.cartoon_src_state.select(Some(app.cartoon_src_idx));
+                                }
+                            }
+                            // Binge-watching: next episode shortcut
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                app.cartoon_next_episode();
+                            }
+                            // Previous episode shortcut
+                            KeyCode::Char('P') => {
+                                app.cartoon_prev_episode();
+                            }
+                            KeyCode::Enter => {
+                                if total > 0 {
+                                    if let Err(e) = app.play_selected_cartoon_source() {
+                                        app.error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                let is_series = app.selected_cartoon().is_none_or(|c| c.is_series);
+                                if is_series {
+                                    app.screen = Screen::CartoonSeasonEpisode;
+                                } else {
+                                    app.screen = Screen::CartoonSearch;
+                                }
+                                app.status_msg = None;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // --------------------------------------------------------
+                    // Screen: Live TV (IPTV)
+                    // --------------------------------------------------------
+                    Screen::IptvList => {
+                        let filtered_count = app.filtered_iptv_channels().len();
+                        match key.code {
+                            KeyCode::Up => {
+                                if filtered_count > 0 {
+                                    app.iptv_idx = app.iptv_idx.saturating_sub(1);
+                                    app.iptv_state.select(Some(app.iptv_idx));
+                                }
+                            }
+                            KeyCode::Down => {
+                                if filtered_count > 0 && app.iptv_idx + 1 < filtered_count {
+                                    app.iptv_idx += 1;
+                                    app.iptv_state.select(Some(app.iptv_idx));
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if filtered_count > 0 {
+                                    app.iptv_idx = app.iptv_idx.saturating_sub(10);
+                                    app.iptv_state.select(Some(app.iptv_idx));
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if filtered_count > 0 {
+                                    app.iptv_idx = (app.iptv_idx + 10).min(filtered_count - 1);
+                                    app.iptv_state.select(Some(app.iptv_idx));
+                                }
+                            }
+                            // Category cycling: Tab, [, ]
+                            KeyCode::Tab | KeyCode::Char(']') => {
+                                let cats = [
+                                    "All", "News", "Movies", "Sports", "Entertainment", "Music", "Documentary", "Kids", "General"
+                                ];
+                                if let Some(pos) = cats.iter().position(|&c| c == app.iptv_category) {
+                                    let next = (pos + 1) % cats.len();
+                                    app.iptv_category = cats[next].to_string();
+                                } else {
+                                    app.iptv_category = "All".to_string();
+                                }
+                                app.iptv_idx = 0;
+                                app.iptv_state.select(Some(0));
+                            }
+                            KeyCode::BackTab | KeyCode::Char('[') => {
+                                let cats = [
+                                    "All", "News", "Movies", "Sports", "Entertainment", "Music", "Documentary", "Kids", "General"
+                                ];
+                                if let Some(pos) = cats.iter().position(|&c| c == app.iptv_category) {
+                                    let prev = if pos == 0 { cats.len() - 1 } else { pos - 1 };
+                                    app.iptv_category = cats[prev].to_string();
+                                } else {
+                                    app.iptv_category = "All".to_string();
+                                }
+                                app.iptv_idx = 0;
+                                app.iptv_state.select(Some(0));
+                            }
+                            KeyCode::Enter => {
+                                if filtered_count > 0 {
+                                    if let Err(e) = app.play_selected_iptv() {
+                                        app.error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                app.iptv_query.pop();
+                                app.iptv_idx = 0;
+                                app.iptv_state.select(Some(0));
+                            }
+                            KeyCode::Esc => {
+                                if !app.iptv_query.is_empty() {
+                                    app.iptv_query.clear();
+                                    app.iptv_idx = 0;
+                                    app.iptv_state.select(Some(0));
+                                } else {
+                                    app.switch_mode(AppMode::MoviesAndSeries);
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                app.iptv_query.push(c);
+                                app.iptv_idx = 0;
+                                app.iptv_state.select(Some(0));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // --------------------------------------------------------
+                    // Screen: Internet Archive Search
+                    // --------------------------------------------------------
+                    Screen::ArchiveSearch => match key.code {
+                        KeyCode::Enter => {
+                            if app.archive_results.is_empty() || !app.archive_query.is_empty() && app.archive_state.selected().is_none() {
+                                app.search_archive();
+                            } else if !app.archive_results.is_empty() {
+                                app.select_archive_item_confirm();
+                            }
+                        }
+                        KeyCode::Up => {
+                            let total = app.archive_results.len();
+                            if total > 0 {
+                                app.archive_idx = app.archive_idx.saturating_sub(1);
+                                app.archive_state.select(Some(app.archive_idx));
+                            }
+                        }
+                        KeyCode::Down => {
+                            let total = app.archive_results.len();
+                            if total > 0 && app.archive_idx + 1 < total {
+                                app.archive_idx += 1;
+                                app.archive_state.select(Some(app.archive_idx));
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.archive_query.pop();
+                        }
+                        KeyCode::Esc => {
+                            if !app.archive_query.is_empty() {
+                                app.archive_query.clear();
+                            } else {
+                                app.switch_mode(AppMode::MoviesAndSeries);
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            app.archive_query.push(c);
+                        }
+                        _ => {}
+                    },
+
+                    // --------------------------------------------------------
+                    // Screen: Internet Archive Files
+                    // --------------------------------------------------------
+                    Screen::ArchiveFiles => {
+                        let total = app.archive_files.len();
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if total > 0 {
+                                    app.archive_file_idx = app.archive_file_idx.saturating_sub(1);
+                                    app.archive_file_state.select(Some(app.archive_file_idx));
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if total > 0 && app.archive_file_idx + 1 < total {
+                                    app.archive_file_idx += 1;
+                                    app.archive_file_state.select(Some(app.archive_file_idx));
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if total > 0 {
+                                    if let Err(e) = app.play_selected_archive_file() {
+                                        app.error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.screen = Screen::ArchiveSearch;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // --------------------------------------------------------
+                    // Screen: Direct Stream Input
+                    // --------------------------------------------------------
+                    Screen::DirectInput => match key.code {
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.direct_url_input.clear();
+                        }
+                        KeyCode::Enter => {
+                            if let Err(e) = app.play_direct_input() {
+                                app.error = Some(e.to_string());
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.direct_url_input.pop();
+                        }
+                        KeyCode::Esc => {
+                            if !app.direct_url_input.is_empty() {
+                                app.direct_url_input.clear();
+                            } else {
+                                app.switch_mode(AppMode::MoviesAndSeries);
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            app.direct_url_input.push(c);
+                        }
+                        _ => {}
+                    },
+
+                    // --------------------------------------------------------
+                    // Screen: Watch History & Continue Watching
+                    // --------------------------------------------------------
+                    Screen::History => {
+                        let total = app.history.len();
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if total > 0 {
+                                    app.history_idx = app.history_idx.saturating_sub(1);
+                                    app.history_state.select(Some(app.history_idx));
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if total > 0 && app.history_idx + 1 < total {
+                                    app.history_idx += 1;
+                                    app.history_state.select(Some(app.history_idx));
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if total > 0 {
+                                    app.history_idx = app.history_idx.saturating_sub(5);
+                                    app.history_state.select(Some(app.history_idx));
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if total > 0 {
+                                    app.history_idx = (app.history_idx + 5).min(total - 1);
+                                    app.history_state.select(Some(app.history_idx));
+                                }
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                if total > 0 {
+                                    app.history_idx = 0;
+                                    app.history_state.select(Some(0));
+                                }
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                if total > 0 {
+                                    app.history_idx = total - 1;
+                                    app.history_state.select(Some(app.history_idx));
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if total > 0 {
+                                    if let Err(e) = app.continue_watching_selected(false) {
+                                        app.error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                if total > 0 {
+                                    if let Err(e) = app.continue_watching_selected(true) {
+                                        app.error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Char('d') | KeyCode::Delete => {
+                                if total > 0 {
+                                    app.delete_history_item(app.history_idx);
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                if total > 0 {
+                                    app.clear_history();
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.switch_mode(AppMode::MoviesAndSeries);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -1641,6 +1213,8 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use models::SourceItem;
+    use sources::torrentio::{make_magnet, parse_release_metadata, parse_source_line};
 
     #[test]
     fn test_parse_source_line_dots_and_quality() {
@@ -1667,7 +1241,7 @@ mod tests {
 
     #[test]
     fn test_is_series_detection() {
-        let movie = ImdbResult {
+        let movie = models::ImdbResult {
             id: "tt0133093".to_string(),
             q: Some("feature".to_string()),
             qid: Some("movie".to_string()),
@@ -1680,7 +1254,7 @@ mod tests {
         assert_eq!(movie.kind_label(), "Movie");
         assert_eq!(movie.year_str(), "1999");
 
-        let tv = ImdbResult {
+        let tv = models::ImdbResult {
             id: "tt0903747".to_string(),
             q: Some("TV series".to_string()),
             qid: Some("tvSeries".to_string()),
@@ -1701,18 +1275,24 @@ mod tests {
             provider: "Torrentio".to_string(),
             resolution: "4K".to_string(),
             hdr_info: None,
+            codec: None,
             seeds: Some(100),
+            size_bytes: Some(10_000_000_000),
             size_str: "10 GB".to_string(),
             title: "Test 4K".to_string(),
+            stream: models::StreamSource::SssPick { num: "1".to_string() },
         };
         let item_1080p = SourceItem {
             num: "2".to_string(),
             provider: "Torrentio".to_string(),
             resolution: "1080p".to_string(),
             hdr_info: None,
+            codec: None,
             seeds: Some(50),
+            size_bytes: Some(2_000_000_000),
             size_str: "2 GB".to_string(),
             title: "Test 1080p".to_string(),
+            stream: models::StreamSource::SssPick { num: "2".to_string() },
         };
 
         assert!(QualityFilter::All.matches(&item_4k));
@@ -1724,11 +1304,386 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_filter() {
+        let item_tpb = SourceItem {
+            num: "1".to_string(),
+            provider: "The Pirate Bay".to_string(),
+            resolution: "1080p".to_string(),
+            hdr_info: None,
+            codec: None,
+            seeds: Some(100),
+            size_bytes: None,
+            size_str: "2 GB".to_string(),
+            title: "Test TPB".to_string(),
+            stream: models::StreamSource::Torrent {
+                magnet: "magnet:?".to_string(),
+                info_hash: "abcd".to_string(),
+                file_idx: None,
+            },
+        };
+
+        assert!(ProviderFilter::All.matches(&item_tpb));
+        assert!(ProviderFilter::ThePirateBay.matches(&item_tpb));
+        assert!(!ProviderFilter::Torrentio.matches(&item_tpb));
+        assert!(!ProviderFilter::TorrentsCsv.matches(&item_tpb));
+    }
+
+    #[test]
+    fn test_parse_release_metadata() {
+        let text = "Dune.Part.Two.2024.2160p.UHD.BluRay.DV.HDR10+.HEVC.Atmos-TERMiNAL";
+        let (res, hdr, codec) = parse_release_metadata(text);
+        assert_eq!(res, "4K");
+        assert_eq!(hdr, Some("DV/HDR".to_string()));
+        assert_eq!(codec, Some("HEVC/x265".to_string()));
+
+        let text2 = "Severance.S01E01.1080p.WEB-DL.x264.AAC";
+        let (res2, hdr2, codec2) = parse_release_metadata(text2);
+        assert_eq!(res2, "1080p");
+        assert_eq!(hdr2, None);
+        assert_eq!(codec2, Some("x264".to_string()));
+    }
+
+    #[test]
+    fn test_make_magnet() {
+        let magnet = make_magnet("D7A46713EAEE18C746B3254B7D1492A50FD9D6CE", "The Matrix", &[]);
+        assert!(magnet.starts_with("magnet:?xt=urn:btih:d7a46713eaee18c746b3254b7d1492a50fd9d6ce"));
+        assert!(magnet.contains("dn=The%20Matrix"));
+        assert!(magnet.contains("tr=udp%3A%2F%2Ftracker.opentrackr.org"));
+    }
+
+    #[test]
+    fn test_iptv_m3u_parser() {
+        let m3u_data = r#"#EXTM3U
+#EXTINF:-1 tvg-id="BBCNews.uk" tvg-logo="" group-title="News",BBC News HD (1080p)
+https://stream.example.com/bbc_news.m3u8
+#EXTINF:-1 tvg-id="SkyCinema.uk" tvg-logo="" group-title="Movies;Action",Sky Cinema Premiere (720p)
+https://stream.example.com/sky_cinema.m3u8
+"#;
+        let channels = sources::iptv::parse_m3u(m3u_data);
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].name, "BBC News HD (1080p)");
+        assert_eq!(channels[0].group, "News");
+        assert_eq!(channels[0].resolution, "1080p");
+        assert_eq!(channels[0].url, "https://stream.example.com/bbc_news.m3u8");
+
+        assert_eq!(channels[1].name, "Sky Cinema Premiere (720p)");
+        assert_eq!(channels[1].group, "Movies");
+        assert_eq!(channels[1].resolution, "720p");
+    }
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(sources::piratebay::format_size(1_073_741_824), "1.00 GB");
+        assert_eq!(sources::piratebay::format_size(2_147_483_648), "2.00 GB");
+        assert_eq!(sources::piratebay::format_size(524_288_000), "500.0 MB");
+        assert_eq!(sources::piratebay::format_size(1024), "1.0 KB");
+        assert_eq!(sources::piratebay::format_size(512), "512 B");
+    }
+
+    #[test]
+    fn test_archive_search_and_metadata_flow() {
+        // Test query formatting for archive
+        let clean_kw: String = "night of the living dead 1968"
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+            .collect();
+        let words: Vec<&str> = clean_kw.split_whitespace().collect();
+        let query = words.join(" AND ");
+        assert_eq!(query, "night AND of AND the AND living AND dead AND 1968");
+    }
+
+    #[test]
     fn test_live_search_title() {
-        let results = search_title("Inception").expect("Search should succeed");
+        let results = sources::search_title("Inception").expect("Search should succeed");
         assert!(!results.is_empty(), "Should return at least one result for Inception");
         let first = &results[0];
         assert_eq!(first.l.as_deref(), Some("Inception"));
         assert!(!first.is_series());
+    }
+
+    #[test]
+    fn test_kitsu_anime_model() {
+        let tv_anime = models::KitsuAnime {
+            id: "46474".to_string(),
+            title: "Sousou no Frieren".to_string(),
+            title_en: Some("Frieren: Beyond Journey's End".to_string()),
+            title_jp: Some("葬送のフリーレン".to_string()),
+            synopsis: "Elven mage journey".to_string(),
+            episode_count: Some(28),
+            subtype: "TV".to_string(),
+            status: "finished".to_string(),
+            year: "2023".to_string(),
+            rating: Some("88.8".to_string()),
+            age_rating_guide: Some("PG - Teens 13+".to_string()),
+        };
+
+        assert!(!tv_anime.is_movie());
+        assert_eq!(tv_anime.display_title(), "Frieren: Beyond Journey's End");
+        assert_eq!(tv_anime.subtype_label(), "TV Series");
+        assert_eq!(tv_anime.status_label(), "Finished");
+        assert_eq!(tv_anime.episodes_display(), "28 eps");
+
+        let movie_anime = models::KitsuAnime {
+            id: "11614".to_string(),
+            title: "Kimi no Na wa.".to_string(),
+            title_en: Some("Your Name.".to_string()),
+            title_jp: Some("君の名は。".to_string()),
+            synopsis: "Two strangers find themselves linked".to_string(),
+            episode_count: Some(1),
+            subtype: "movie".to_string(),
+            status: "finished".to_string(),
+            year: "2016".to_string(),
+            rating: Some("90.1".to_string()),
+            age_rating_guide: Some("PG".to_string()),
+        };
+
+        assert!(movie_anime.is_movie());
+        assert_eq!(movie_anime.display_title(), "Your Name.");
+        assert_eq!(movie_anime.subtype_label(), "Movie");
+    }
+
+    #[test]
+    fn test_parse_nyaa_rss() {
+        let sample_xml = r#"<rss version="2.0">
+            <channel>
+                <title>Nyaa - RSS</title>
+                <item>
+                    <title>[SubsPlease] Frieren - 01 (1080p) [F502B6D4].mkv</title>
+                    <nyaa:infoHash>bc25231f657d115e61e68d0e124d3ff5ec101f69</nyaa:infoHash>
+                    <nyaa:seeders>142</nyaa:seeders>
+                    <nyaa:size>1.4 GiB</nyaa:size>
+                </item>
+                <item>
+                    <title>[Erai-raws] Frieren - 02 [720p][MultiSub].mkv</title>
+                    <nyaa:infoHash>3b918fd3e786cf572f6c069fd3d65aeb1ba94454</nyaa:infoHash>
+                    <nyaa:seeders>35</nyaa:seeders>
+                    <nyaa:size>750.0 MiB</nyaa:size>
+                </item>
+            </channel>
+        </rss>"#;
+
+        let parsed_ep1 = sources::anime::parse_nyaa_rss(sample_xml, false, 1);
+        assert_eq!(parsed_ep1.len(), 1);
+        assert_eq!(parsed_ep1[0].provider, "NyaaSi (SubsPlease)");
+        assert_eq!(parsed_ep1[0].resolution, "1080p");
+        assert_eq!(parsed_ep1[0].seeds, Some(142));
+        assert_eq!(parsed_ep1[0].size_str, "1.4 GiB");
+
+        let parsed_ep2 = sources::anime::parse_nyaa_rss(sample_xml, false, 2);
+        assert_eq!(parsed_ep2.len(), 1);
+        assert_eq!(parsed_ep2[0].provider, "NyaaSi (Erai-raws)");
+        assert_eq!(parsed_ep2[0].resolution, "720p");
+        assert_eq!(parsed_ep2[0].seeds, Some(35));
+    }
+
+    #[test]
+    fn test_anime_parse_size_string() {
+        assert_eq!(sources::anime::parse_size_string("1.4 GiB"), Some(1_503_238_553));
+        assert_eq!(sources::anime::parse_size_string("500 MiB"), Some(524_288_000));
+        assert_eq!(sources::anime::parse_size_string("100 KiB"), Some(102_400));
+    }
+
+    #[test]
+    fn test_provider_filter_nyaa() {
+        let nyaa_item = SourceItem {
+            num: "1".to_string(),
+            provider: "NyaaSi (SubsPlease)".to_string(),
+            resolution: "1080p".to_string(),
+            hdr_info: None,
+            codec: Some("x264".to_string()),
+            seeds: Some(150),
+            size_bytes: Some(1_500_000_000),
+            size_str: "1.5 GB".to_string(),
+            title: "Anime Episode 1".to_string(),
+            stream: models::StreamSource::Torrent {
+                magnet: "magnet:?".to_string(),
+                info_hash: "bc25231f657d115e61e68d0e124d3ff5ec101f69".to_string(),
+                file_idx: None,
+            },
+        };
+
+        assert!(ProviderFilter::All.matches(&nyaa_item));
+        assert!(ProviderFilter::NyaaSi.matches(&nyaa_item));
+        assert!(!ProviderFilter::Torrentio.matches(&nyaa_item));
+        assert!(!ProviderFilter::ThePirateBay.matches(&nyaa_item));
+    }
+
+    #[test]
+    fn test_title_matches_episode() {
+        use sources::anime::title_matches_episode;
+        assert!(title_matches_episode("[SubsPlease] Sousou no Frieren - 01 (1080p) [F502B6D4].mkv", 1));
+        assert!(!title_matches_episode("[SubsPlease] Sousou no Frieren - 01 (1080p) [F502B6D4].mkv", 2));
+        assert!(title_matches_episode("[Erai-raws] Jujutsu Kaisen 2nd Season - 23 [1080p][Multiple Subtitle].mkv", 23));
+        assert!(!title_matches_episode("[Erai-raws] Jujutsu Kaisen 2nd Season - 23 [1080p][Multiple Subtitle].mkv", 3));
+        assert!(title_matches_episode("[HorribleSubs] One Piece - 892 [720p].mkv", 892));
+        assert!(title_matches_episode("Attack on Titan S04E15 1080p WEB-DL.mkv", 15));
+        assert!(title_matches_episode("[SubsPlease] Frieren (01-28) (1080p) [Batch]", 5));
+    }
+
+    #[test]
+    fn test_live_search_anime() {
+        let results = sources::anime::search_anime("Frieren").expect("Anime search should succeed");
+        assert!(!results.is_empty(), "Should return at least one result for Frieren");
+        let first = &results[0];
+        assert!(first.title.to_lowercase().contains("frieren") || first.display_title().to_lowercase().contains("frieren"));
+    }
+
+    #[test]
+    fn test_clean_html_summary() {
+        use sources::cartoon::clean_html_summary;
+        let html = "<p>A boy named <b>Finn</b> &amp; his dog Jake in the Land of Ooo. It&#039;s &quot;mathematical&quot;!</p>";
+        let cleaned = clean_html_summary(html);
+        assert_eq!(cleaned, "A boy named Finn & his dog Jake in the Land of Ooo. It's \"mathematical\"!");
+    }
+
+    #[test]
+    fn test_popular_cartoons_catalog() {
+        use sources::cartoon::get_curated_popular_cartoons;
+        let catalog = get_curated_popular_cartoons();
+        assert!(catalog.len() >= 10);
+        assert!(catalog.iter().any(|c| c.title == "Adventure Time"));
+        assert!(catalog.iter().any(|c| c.title == "Gravity Falls"));
+        assert!(catalog.iter().any(|c| c.imdb_id.as_deref() == Some("tt2861424"))); // Rick and Morty
+    }
+
+    #[test]
+    fn test_cartoon_item_properties() {
+        use crate::models::CartoonItem;
+        let c = CartoonItem {
+            id: "123".to_string(),
+            imdb_id: Some("tt1305826".to_string()),
+            title: "Adventure Time".to_string(),
+            year: "2010".to_string(),
+            is_series: true,
+            genres: vec!["Animation".to_string(), "Adventure".to_string(), "Comedy".to_string()],
+            network: Some("Cartoon Network".to_string()),
+            status: "Ended".to_string(),
+            summary: "Finn and Jake explore Ooo.".to_string(),
+            rating: Some("8.6".to_string()),
+        };
+
+        assert_eq!(c.title, "Adventure Time");
+        assert_eq!(c.display_network(), "Cartoon Network");
+        assert_eq!(c.genres_str(), "Animation, Adventure, Comedy");
+        assert!(c.is_series);
+    }
+
+    #[test]
+    fn test_live_search_cartoons() {
+        let results = sources::cartoon::search_cartoons("Avatar").expect("Cartoon search should succeed");
+        assert!(!results.is_empty(), "Should return at least one result for Avatar");
+        let found = results.iter().any(|r| r.title.to_lowercase().contains("avatar"));
+        assert!(found, "Should find Avatar in search results");
+    }
+
+    #[test]
+    fn test_history_entry_properties() {
+        let entry = models::HistoryEntry {
+            id: "Anime:Frieren:None:Some(5)".to_string(),
+            mode: "Anime".to_string(),
+            title: "Frieren: Beyond Journey's End".to_string(),
+            ttid: None,
+            year: Some("2023".to_string()),
+            season: None,
+            episode: Some(5),
+            provider: "NyaaSi (SubsPlease)".to_string(),
+            resolution: "1080p".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            stream: models::StreamSource::DirectUrl {
+                url: "http://example.com/video.mp4".to_string(),
+            },
+        };
+
+        assert_eq!(entry.badge_label(), "ANIME");
+        assert_eq!(entry.progress_str(), "EP 05");
+        assert_eq!(entry.next_episode_str(), Some("EP 06".to_string()));
+        assert_eq!(entry.time_ago_str(), "Just now");
+    }
+
+    #[test]
+    fn test_history_series_next_episode() {
+        let entry = models::HistoryEntry {
+            id: "Cartoons:Gravity Falls:Some(1):Some(4)".to_string(),
+            mode: "Cartoons".to_string(),
+            title: "Gravity Falls".to_string(),
+            ttid: Some("tt1865718".to_string()),
+            year: Some("2012".to_string()),
+            season: Some(1),
+            episode: Some(4),
+            provider: "Torrentio".to_string(),
+            resolution: "1080p".to_string(),
+            timestamp: 1_700_000_000,
+            stream: models::StreamSource::DirectUrl {
+                url: "http://example.com/stream.mkv".to_string(),
+            },
+        };
+
+        assert_eq!(entry.badge_label(), "CARTOON");
+        assert_eq!(entry.progress_str(), "S01E04");
+        assert_eq!(entry.next_episode_str(), Some("S01E05".to_string()));
+    }
+
+    #[test]
+    fn test_app_record_history_mru() {
+        let mut app = App::new();
+        app.history.clear();
+
+        app.record_history(
+            "Anime",
+            "Frieren",
+            None,
+            Some("2023".to_string()),
+            None,
+            Some(1),
+            "NyaaSi",
+            "1080p",
+            models::StreamSource::DirectUrl { url: "http://1".to_string() },
+        );
+
+        app.record_history(
+            "Cartoons",
+            "Avatar",
+            None,
+            Some("2005".to_string()),
+            Some(1),
+            Some(1),
+            "Torrentio",
+            "1080p",
+            models::StreamSource::DirectUrl { url: "http://2".to_string() },
+        );
+
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[0].title, "Avatar");
+        assert_eq!(app.history[1].title, "Frieren");
+
+        // Re-watching Frieren should move it to index 0 with updated episode
+        app.record_history(
+            "Anime",
+            "Frieren",
+            None,
+            Some("2023".to_string()),
+            None,
+            Some(2),
+            "NyaaSi",
+            "1080p",
+            models::StreamSource::DirectUrl { url: "http://3".to_string() },
+        );
+
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[0].title, "Frieren");
+        assert_eq!(app.history[0].episode, Some(2));
+        assert_eq!(app.history[1].title, "Avatar");
+
+        // Delete item
+        app.delete_history_item(0);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[0].title, "Avatar");
+
+        // Clear all
+        app.clear_history();
+        assert!(app.history.is_empty());
     }
 }
