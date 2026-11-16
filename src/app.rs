@@ -35,6 +35,7 @@ pub struct App {
     pub quality_filter: QualityFilter,
     pub provider_filter: ProviderFilter,
     pub sort_order: SortOrder,
+    pub hide_foreign_dubs: bool,
 
     // --- Anime State ---
     pub anime_query: String,
@@ -121,7 +122,8 @@ impl App {
             src_state: ListState::default(),
             quality_filter: QualityFilter::All,
             provider_filter: ProviderFilter::All,
-            sort_order: SortOrder::Seeders,
+            sort_order: SortOrder::Recommended,
+            hide_foreign_dubs: true,
 
             anime_query: String::new(),
             anime_results: Vec::new(),
@@ -133,7 +135,7 @@ impl App {
             anime_src_state: ListState::default(),
             anime_quality_filter: QualityFilter::All,
             anime_provider_filter: ProviderFilter::All,
-            anime_sort_order: SortOrder::Seeders,
+            anime_sort_order: SortOrder::Recommended,
 
             cartoon_query: String::new(),
             cartoon_results: Vec::new(),
@@ -147,7 +149,7 @@ impl App {
             cartoon_src_state: ListState::default(),
             cartoon_quality_filter: QualityFilter::All,
             cartoon_provider_filter: ProviderFilter::All,
-            cartoon_sort_order: SortOrder::Seeders,
+            cartoon_sort_order: SortOrder::Recommended,
 
             iptv_channels: Vec::new(),
             iptv_query: String::new(),
@@ -343,7 +345,7 @@ impl App {
         self.sources = s;
         self.quality_filter = QualityFilter::All;
         self.provider_filter = ProviderFilter::All;
-        self.sort_order = SortOrder::Seeders;
+        self.sort_order = SortOrder::Recommended;
         self.src_idx = 0;
         self.src_state = ListState::default();
 
@@ -361,11 +363,17 @@ impl App {
     }
 
     pub fn filtered_source_indices(&self) -> Vec<usize> {
+        let has_non_dub = self.sources.iter().any(|s| !s.is_foreign_dub_only());
+        let filter_dubs = self.hide_foreign_dubs && has_non_dub;
+
         let mut indices: Vec<usize> = self
             .sources
             .iter()
             .enumerate()
             .filter(|(_, item)| {
+                if filter_dubs && item.is_foreign_dub_only() {
+                    return false;
+                }
                 self.quality_filter.matches(item) && self.provider_filter.matches(item)
             })
             .map(|(i, _)| i)
@@ -373,6 +381,13 @@ impl App {
 
         // Sort indices according to selected sort order
         match self.sort_order {
+            SortOrder::Recommended => {
+                indices.sort_by(|&a, &b| {
+                    let score_b = self.sources[b].smart_score();
+                    let score_a = self.sources[a].smart_score();
+                    score_b.cmp(&score_a)
+                });
+            }
             SortOrder::Seeders => {
                 indices.sort_by(|&a, &b| {
                     let seeds_b = self.sources[b].seeds.unwrap_or(0);
@@ -406,62 +421,110 @@ impl App {
         indices
     }
 
-    pub fn play_selected_source(&mut self) -> io::Result<()> {
+    pub fn play_source_with_failover(&mut self, start_rank: usize) -> io::Result<()> {
         let show = match self.selected_show() {
             Some(s) => s.clone(),
             None => return Ok(()),
         };
 
         let filtered = self.filtered_source_indices();
-        let actual_idx = match filtered.get(self.src_idx) {
-            Some(&idx) => idx,
-            None => return Ok(()),
-        };
-        let src = match self.sources.get(actual_idx) {
-            Some(s) => s.clone(),
-            None => return Ok(()),
-        };
+        if filtered.is_empty() {
+            self.error = Some("No viable stream sources found for this title".to_string());
+            return Ok(());
+        }
 
         let ep_info = if show.is_series() {
             Some((self.season, self.episode))
         } else {
             None
         };
-
         let title = show.l.as_deref().unwrap_or("Title");
 
-        self.record_history(
-            "Movies & Series",
-            title,
-            Some(show.id.clone()),
-            Some(show.year_str()),
-            if show.is_series() { Some(self.season) } else { None },
-            if show.is_series() { Some(self.episode) } else { None },
-            &src.provider,
-            &src.resolution,
-            src.stream.clone(),
-        );
+        let mut last_err = String::new();
+        let max_attempts = 3.min(filtered.len().saturating_sub(start_rank).max(1));
 
-        match player::play_source(&src, title, Some(&show.id), ep_info)? {
-            Ok(()) => {
-                if show.is_series() {
-                    self.status_msg = Some(format!(
-                        "Playback finished: {} S{:02}E{:02}. Press [N] for Next Episode!",
-                        title, self.season, self.episode
-                    ));
-                } else {
-                    self.status_msg = Some(format!(
-                        "Playback finished: {}. [Enter] to replay, [Esc] to go back.",
-                        title
-                    ));
-                }
+        for attempt in 0..max_attempts {
+            let rank = start_rank + attempt;
+            let actual_idx = match filtered.get(rank) {
+                Some(&idx) => idx,
+                None => break,
+            };
+            let src = match self.sources.get(actual_idx) {
+                Some(s) => s.clone(),
+                None => break,
+            };
+
+            self.src_idx = rank;
+            self.src_state.select(Some(rank));
+
+            if attempt > 0 {
+                eprintln!(
+                    "\r\n\x1b[1;33m[tsss-tui Failover]\x1b[0m Stream candidate #{} failed/stalled. Auto-failing over to #{} ({} - {})...",
+                    rank,
+                    rank + 1,
+                    src.provider,
+                    src.resolution
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1200));
             }
-            Err(e) => {
-                self.error = Some(e);
+
+            self.record_history(
+                "Movies & Series",
+                title,
+                Some(show.id.clone()),
+                Some(show.year_str()),
+                if show.is_series() { Some(self.season) } else { None },
+                if show.is_series() { Some(self.episode) } else { None },
+                &src.provider,
+                &src.resolution,
+                src.stream.clone(),
+            );
+
+            match player::play_source(&src, title, Some(&show.id), ep_info)? {
+                Ok(()) => {
+                    self.error = None;
+                    if show.is_series() {
+                        self.status_msg = Some(format!(
+                            "Playback finished: {} S{:02}E{:02}. Press [N] for Next Episode!",
+                            title, self.season, self.episode
+                        ));
+                    } else {
+                        self.status_msg = Some(format!(
+                            "Playback finished: {}. [Enter] to replay, [Esc] to go back.",
+                            title
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < max_attempts {
+                        self.status_msg = Some(format!(
+                            "Stream candidate stalled, auto-failing over to candidate #{}...",
+                            rank + 2
+                        ));
+                    }
+                }
             }
         }
 
+        self.error = Some(format!("All stream attempts failed: {last_err}"));
         Ok(())
+    }
+
+    pub fn play_selected_source(&mut self) -> io::Result<()> {
+        self.play_source_with_failover(self.src_idx)
+    }
+
+    pub fn smart_play_current_title(&mut self) -> io::Result<()> {
+        if self.sources.is_empty() {
+            self.prepare_load_sources();
+            self.execute_load_sources();
+        }
+        self.sort_order = SortOrder::Recommended;
+        self.src_idx = 0;
+        self.src_state.select(Some(0));
+        self.play_source_with_failover(0)
     }
 
     pub fn next_episode(&mut self) {
@@ -868,7 +931,7 @@ impl App {
         self.anime_sources = sources;
         self.anime_quality_filter = QualityFilter::All;
         self.anime_provider_filter = ProviderFilter::All;
-        self.anime_sort_order = SortOrder::Seeders;
+        self.anime_sort_order = SortOrder::Recommended;
         self.anime_src_idx = 0;
         self.anime_src_state = ListState::default();
 
@@ -886,17 +949,30 @@ impl App {
     }
 
     pub fn filtered_anime_source_indices(&self) -> Vec<usize> {
+        let has_non_dub = self.anime_sources.iter().any(|s| !s.is_foreign_dub_only());
+        let filter_dubs = self.hide_foreign_dubs && has_non_dub;
+
         let mut indices: Vec<usize> = self
             .anime_sources
             .iter()
             .enumerate()
             .filter(|(_, item)| {
+                if filter_dubs && item.is_foreign_dub_only() {
+                    return false;
+                }
                 self.anime_quality_filter.matches(item) && self.anime_provider_filter.matches(item)
             })
             .map(|(i, _)| i)
             .collect();
 
         match self.anime_sort_order {
+            SortOrder::Recommended => {
+                indices.sort_by(|&a, &b| {
+                    let score_b = self.anime_sources[b].smart_score();
+                    let score_a = self.anime_sources[a].smart_score();
+                    score_b.cmp(&score_a)
+                });
+            }
             SortOrder::Seeders => {
                 indices.sort_by(|&a, &b| {
                     let seeds_b = self.anime_sources[b].seeds.unwrap_or(0);
@@ -930,62 +1006,109 @@ impl App {
         indices
     }
 
-    pub fn play_selected_anime_source(&mut self) -> io::Result<()> {
+    pub fn play_anime_source_with_failover(&mut self, start_rank: usize) -> io::Result<()> {
         let anime = match self.selected_anime() {
             Some(a) => a.clone(),
             None => return Ok(()),
         };
 
         let filtered = self.filtered_anime_source_indices();
-        let actual_idx = match filtered.get(self.anime_src_idx) {
-            Some(&idx) => idx,
-            None => return Ok(()),
-        };
-        let src = match self.anime_sources.get(actual_idx) {
-            Some(s) => s.clone(),
-            None => return Ok(()),
-        };
+        if filtered.is_empty() {
+            self.error = Some("No anime sources found".to_string());
+            return Ok(());
+        }
 
-        let title = anime.display_title();
+        let title = anime.display_title().to_string();
         let is_movie = anime.is_movie();
-
         let ep_str = if is_movie {
-            title.to_string()
+            title.clone()
         } else {
             format!("{title} Episode {:02}", self.anime_episode)
         };
 
-        self.record_history(
-            "Anime",
-            title,
-            None,
-            Some(anime.year.clone()),
-            None,
-            if is_movie { None } else { Some(self.anime_episode) },
-            &src.provider,
-            &src.resolution,
-            src.stream.clone(),
-        );
+        let mut last_err = String::new();
+        let max_attempts = 3.min(filtered.len().saturating_sub(start_rank).max(1));
 
-        match player::play_source(&src, &ep_str, None, None)? {
-            Ok(()) => {
-                if is_movie {
-                    self.status_msg = Some(format!(
-                        "Playback finished: {title}. [Enter] to replay, [Esc] to go back."
-                    ));
-                } else {
-                    self.status_msg = Some(format!(
-                        "Playback finished: {title} Episode {:02}. Press [N] for Next Episode!",
-                        self.anime_episode
-                    ));
-                }
+        for attempt in 0..max_attempts {
+            let rank = start_rank + attempt;
+            let actual_idx = match filtered.get(rank) {
+                Some(&idx) => idx,
+                None => break,
+            };
+            let src = match self.anime_sources.get(actual_idx) {
+                Some(s) => s.clone(),
+                None => break,
+            };
+
+            self.anime_src_idx = rank;
+            self.anime_src_state.select(Some(rank));
+
+            if attempt > 0 {
+                eprintln!(
+                    "\r\n\x1b[1;33m[tsss-tui Failover]\x1b[0m Anime stream candidate #{} failed. Auto-failing over to #{} ({})...\r\n",
+                    rank,
+                    rank + 1,
+                    src.resolution
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1200));
             }
-            Err(e) => {
-                self.error = Some(e);
+
+            self.record_history(
+                "Anime",
+                &title,
+                None,
+                Some(anime.year.clone()),
+                None,
+                if is_movie { None } else { Some(self.anime_episode) },
+                &src.provider,
+                &src.resolution,
+                src.stream.clone(),
+            );
+
+            match player::play_source(&src, &ep_str, None, None)? {
+                Ok(()) => {
+                    self.error = None;
+                    if is_movie {
+                        self.status_msg = Some(format!(
+                            "Playback finished: {title}. [Enter] to replay, [Esc] to go back."
+                        ));
+                    } else {
+                        self.status_msg = Some(format!(
+                            "Playback finished: {title} Episode {:02}. Press [N] for Next Episode!",
+                            self.anime_episode
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < max_attempts {
+                        self.status_msg = Some(format!(
+                            "Anime candidate stalled, auto-failing over to candidate #{}...",
+                            rank + 2
+                        ));
+                    }
+                }
             }
         }
 
+        self.error = Some(format!("All anime stream attempts failed: {last_err}"));
         Ok(())
+    }
+
+    pub fn play_selected_anime_source(&mut self) -> io::Result<()> {
+        self.play_anime_source_with_failover(self.anime_src_idx)
+    }
+
+    pub fn smart_play_anime(&mut self) -> io::Result<()> {
+        if self.anime_sources.is_empty() {
+            self.prepare_load_anime_sources();
+            self.execute_load_anime_sources();
+        }
+        self.anime_sort_order = SortOrder::Recommended;
+        self.anime_src_idx = 0;
+        self.anime_src_state.select(Some(0));
+        self.play_anime_source_with_failover(0)
     }
 
     pub fn anime_next_episode(&mut self) {
@@ -1113,7 +1236,7 @@ impl App {
         self.cartoon_sources = sources;
         self.cartoon_quality_filter = QualityFilter::All;
         self.cartoon_provider_filter = ProviderFilter::All;
-        self.cartoon_sort_order = SortOrder::Seeders;
+        self.cartoon_sort_order = SortOrder::Recommended;
         self.cartoon_src_idx = 0;
         self.cartoon_src_state = ListState::default();
 
@@ -1131,17 +1254,30 @@ impl App {
     }
 
     pub fn filtered_cartoon_source_indices(&self) -> Vec<usize> {
+        let has_non_dub = self.cartoon_sources.iter().any(|s| !s.is_foreign_dub_only());
+        let filter_dubs = self.hide_foreign_dubs && has_non_dub;
+
         let mut indices: Vec<usize> = self
             .cartoon_sources
             .iter()
             .enumerate()
             .filter(|(_, item)| {
+                if filter_dubs && item.is_foreign_dub_only() {
+                    return false;
+                }
                 self.cartoon_quality_filter.matches(item) && self.cartoon_provider_filter.matches(item)
             })
             .map(|(i, _)| i)
             .collect();
 
         match self.cartoon_sort_order {
+            SortOrder::Recommended => {
+                indices.sort_by(|&a, &b| {
+                    let score_b = self.cartoon_sources[b].smart_score();
+                    let score_a = self.cartoon_sources[a].smart_score();
+                    score_b.cmp(&score_a)
+                });
+            }
             SortOrder::Seeders => {
                 indices.sort_by(|&a, &b| {
                     let seeds_b = self.cartoon_sources[b].seeds.unwrap_or(0);
@@ -1175,68 +1311,114 @@ impl App {
         indices
     }
 
-    pub fn play_selected_cartoon_source(&mut self) -> io::Result<()> {
+    pub fn play_cartoon_source_with_failover(&mut self, start_rank: usize) -> io::Result<()> {
         let cartoon = match self.selected_cartoon() {
             Some(c) => c.clone(),
             None => return Ok(()),
         };
 
         let filtered = self.filtered_cartoon_source_indices();
-        let actual_idx = match filtered.get(self.cartoon_src_idx) {
-            Some(&idx) => idx,
-            None => return Ok(()),
-        };
-        let src = match self.cartoon_sources.get(actual_idx) {
-            Some(s) => s.clone(),
-            None => return Ok(()),
-        };
+        if filtered.is_empty() {
+            self.error = Some("No cartoon sources found".to_string());
+            return Ok(());
+        }
 
         let title = &cartoon.title;
         let is_series = cartoon.is_series;
-
         let ep_str = if is_series {
             format!("{title} S{:02}E{:02}", self.cartoon_season, self.cartoon_episode)
         } else {
             title.to_string()
         };
-
         let ep_info = if is_series {
             Some((self.cartoon_season, self.cartoon_episode))
         } else {
             None
         };
 
-        self.record_history(
-            "Cartoons",
-            title,
-            cartoon.imdb_id.clone(),
-            Some(cartoon.year.clone()),
-            if is_series { Some(self.cartoon_season) } else { None },
-            if is_series { Some(self.cartoon_episode) } else { None },
-            &src.provider,
-            &src.resolution,
-            src.stream.clone(),
-        );
+        let mut last_err = String::new();
+        let max_attempts = 3.min(filtered.len().saturating_sub(start_rank).max(1));
 
-        match player::play_source(&src, &ep_str, cartoon.imdb_id.as_deref(), ep_info)? {
-            Ok(()) => {
-                if is_series {
-                    self.status_msg = Some(format!(
-                        "Playback finished: {title} S{:02}E{:02}. Press [N] for Next Episode!",
-                        self.cartoon_season, self.cartoon_episode
-                    ));
-                } else {
-                    self.status_msg = Some(format!(
-                        "Playback finished: {title}. [Enter] to replay, [Esc] to go back."
-                    ));
-                }
+        for attempt in 0..max_attempts {
+            let rank = start_rank + attempt;
+            let actual_idx = match filtered.get(rank) {
+                Some(&idx) => idx,
+                None => break,
+            };
+            let src = match self.cartoon_sources.get(actual_idx) {
+                Some(s) => s.clone(),
+                None => break,
+            };
+
+            self.cartoon_src_idx = rank;
+            self.cartoon_src_state.select(Some(rank));
+
+            if attempt > 0 {
+                eprintln!(
+                    "\r\n\x1b[1;33m[tsss-tui Failover]\x1b[0m Cartoon stream candidate #{} failed. Auto-failing over to #{} ({})...\r\n",
+                    rank,
+                    rank + 1,
+                    src.resolution
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1200));
             }
-            Err(e) => {
-                self.error = Some(e);
+
+            self.record_history(
+                "Cartoons",
+                title,
+                cartoon.imdb_id.clone(),
+                Some(cartoon.year.clone()),
+                if is_series { Some(self.cartoon_season) } else { None },
+                if is_series { Some(self.cartoon_episode) } else { None },
+                &src.provider,
+                &src.resolution,
+                src.stream.clone(),
+            );
+
+            match player::play_source(&src, &ep_str, cartoon.imdb_id.as_deref(), ep_info)? {
+                Ok(()) => {
+                    self.error = None;
+                    if is_series {
+                        self.status_msg = Some(format!(
+                            "Playback finished: {title} S{:02}E{:02}. Press [N] for Next Episode!",
+                            self.cartoon_season, self.cartoon_episode
+                        ));
+                    } else {
+                        self.status_msg = Some(format!(
+                            "Playback finished: {title}. [Enter] to replay, [Esc] to go back."
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < max_attempts {
+                        self.status_msg = Some(format!(
+                            "Cartoon candidate stalled, auto-failing over to candidate #{}...",
+                            rank + 2
+                        ));
+                    }
+                }
             }
         }
 
+        self.error = Some(format!("All cartoon stream attempts failed: {last_err}"));
         Ok(())
+    }
+
+    pub fn play_selected_cartoon_source(&mut self) -> io::Result<()> {
+        self.play_cartoon_source_with_failover(self.cartoon_src_idx)
+    }
+
+    pub fn smart_play_cartoon(&mut self) -> io::Result<()> {
+        if self.cartoon_sources.is_empty() {
+            self.prepare_load_cartoon_sources();
+            self.execute_load_cartoon_sources();
+        }
+        self.cartoon_sort_order = SortOrder::Recommended;
+        self.cartoon_src_idx = 0;
+        self.cartoon_src_state.select(Some(0));
+        self.play_cartoon_source_with_failover(0)
     }
 
     pub fn cartoon_next_episode(&mut self) {

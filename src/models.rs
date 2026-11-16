@@ -71,6 +71,163 @@ pub struct SourceItem {
     pub stream: StreamSource,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub enum StreamHealth {
+    Stalled, // 0-4 seeds: high risk of stalling
+    Slow,    // 5-14 seeds: low peers, may buffer slowly
+    Fair,    // 15-39 seeds: stable swarm
+    Good,    // 40-79 seeds: fast buffering
+    Instant, // 80+ seeds: instant libtorrent buffer
+}
+
+impl StreamHealth {
+    pub fn badge(&self) -> (&'static str, &'static str) {
+        match self {
+            StreamHealth::Instant => ("🟢 INSTANT", "Instant buffer (80+ seeds)"),
+            StreamHealth::Good => ("🟢 FAST", "Fast swarm (40-79 seeds)"),
+            StreamHealth::Fair => ("🟡 GOOD", "Stable peers (15-39 seeds)"),
+            StreamHealth::Slow => ("🟠 SLOW", "Low peers (5-14 seeds)"),
+            StreamHealth::Stalled => ("🔴 STALLED", "Risk of stall (<5 seeds)"),
+        }
+    }
+}
+
+impl SourceItem {
+    pub fn health(&self) -> StreamHealth {
+        match &self.stream {
+            StreamSource::DirectUrl { .. } => StreamHealth::Instant,
+            _ => match self.seeds {
+                Some(s) if s >= 80 => StreamHealth::Instant,
+                Some(s) if s >= 40 => StreamHealth::Good,
+                Some(s) if s >= 15 => StreamHealth::Fair,
+                Some(s) if s >= 5 => StreamHealth::Slow,
+                _ => StreamHealth::Stalled,
+            },
+        }
+    }
+
+    pub fn is_foreign_dub_only(&self) -> bool {
+        let lower = self.title.to_lowercase();
+
+        // If it explicitly mentions English or multi/dual audio, it's not foreign-only
+        let has_multi_or_eng = lower.contains("eng")
+            || lower.contains("english")
+            || lower.contains("multi")
+            || lower.contains("dual")
+            || lower.contains("en-");
+
+        if has_multi_or_eng {
+            return false;
+        }
+
+        let foreign_markers = [
+            "rus", "russian", "dublado", "legenda", "castellano", "espanol",
+            "french", "truefrench", "ita", "italian", "german", "deutsch",
+            "hindi", "tamil", "telugu", "latino",
+        ];
+
+        for marker in &foreign_markers {
+            if let Some(pos) = lower.find(marker) {
+                let before = if pos == 0 { ' ' } else { lower[..pos].chars().last().unwrap_or(' ') };
+                let after = lower[pos + marker.len()..].chars().next().unwrap_or(' ');
+                let delim = |c: char| !c.is_alphanumeric();
+                if delim(before) && delim(after) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn smart_score(&self) -> i64 {
+        let mut score: i64 = 0;
+
+        // 1. Swarm Health & Seeders
+        match &self.stream {
+            StreamSource::DirectUrl { .. } => {
+                score += 550; // Dedicated HTTP/CDN server
+            }
+            _ => {
+                if let Some(s) = self.seeds {
+                    if s >= 200 {
+                        score += 650;
+                    } else if s >= 100 {
+                        score += 550;
+                    } else if s >= 50 {
+                        score += 450;
+                    } else if s >= 20 {
+                        score += 350;
+                    } else if s >= 10 {
+                        score += 200;
+                    } else if s >= 5 {
+                        score += 100;
+                    } else if s > 0 {
+                        score -= 100;
+                    } else {
+                        score -= 400; // 0 seeds: dead swarm
+                    }
+                } else {
+                    score += 50;
+                }
+            }
+        }
+
+        // 2. Resolution: 1080p and 720p provide optimal balance of fidelity & fast buffering
+        match self.resolution.as_str() {
+            "1080p" => score += 250,
+            "720p" => score += 220,
+            "4K" => score += 180,
+            "480p" | "SD" => score += 80,
+            _ => score += 50,
+        }
+
+        // 3. File Size Sweet Spot (optimal TV episode: 350MB - 3.5GB)
+        if let Some(bytes) = self.size_bytes {
+            let mb = bytes as f64 / (1024.0 * 1024.0);
+            if (350.0..=3500.0).contains(&mb) {
+                score += 200;
+            } else if (200.0..=6000.0).contains(&mb) {
+                score += 120;
+            } else if mb > 12000.0 {
+                score -= 120; // Full season packs or giant remuxes take longer to allocate
+            } else if mb < 150.0 {
+                score -= 150; // Likely sample or low quality
+            }
+        }
+
+        // 4. Source & Codec Quality
+        let lower = self.title.to_lowercase();
+        if lower.contains("web-dl") || lower.contains("webrip") || lower.contains("bluray") {
+            score += 120;
+        } else if lower.contains("hdtv") {
+            score += 80;
+        }
+
+        if lower.contains("x265") || lower.contains("hevc") || lower.contains("h.265") || lower.contains("10bit") {
+            score += 90;
+        } else if lower.contains("x264") || lower.contains("h.264") || lower.contains("avc") {
+            score += 70;
+        }
+
+        // Avoid Camrips / Telesyncs
+        if lower.contains("camrip") || lower.contains("telesync") || lower.contains("hdts") || lower.contains(".cam.") {
+            score -= 600;
+        }
+
+        // 5. Heavy penalty for foreign dub only
+        if self.is_foreign_dub_only() {
+            score -= 500;
+        }
+
+        // 6. Bonus for multi/dual audio
+        if lower.contains("multi") || lower.contains("dual") {
+            score += 40;
+        }
+
+        score
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum QualityFilter {
     All,
@@ -144,6 +301,7 @@ impl ProviderFilter {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortOrder {
+    Recommended,
     Seeders,
     Quality,
     Size,
@@ -152,6 +310,7 @@ pub enum SortOrder {
 impl SortOrder {
     pub fn label(&self) -> &'static str {
         match self {
+            SortOrder::Recommended => "★ Recommended",
             SortOrder::Seeders => "Seeders",
             SortOrder::Quality => "Quality",
             SortOrder::Size => "Size",

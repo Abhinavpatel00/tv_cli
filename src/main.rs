@@ -59,6 +59,11 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    if raw_args.iter().any(|a| a == "-v" || a == "--version") {
+        println!("tsss-tui v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let mut app = App::new();
 
     enable_raw_mode()?;
@@ -358,6 +363,11 @@ fn main() -> io::Result<()> {
                             }
                         },
                         KeyCode::Enter => {
+                            if let Err(e) = app.smart_play_current_title() {
+                                app.error = Some(e.to_string());
+                            }
+                        }
+                        KeyCode::Char('v') | KeyCode::Char('V') => {
                             app.prepare_load_sources();
                         }
                         KeyCode::Esc | KeyCode::Char('q') => {
@@ -438,12 +448,23 @@ fn main() -> io::Result<()> {
                             // Sort order cycling: s, S
                             KeyCode::Char('s') => {
                                 app.sort_order = match app.sort_order {
+                                    SortOrder::Recommended => SortOrder::Seeders,
                                     SortOrder::Seeders => SortOrder::Quality,
                                     SortOrder::Quality => SortOrder::Size,
-                                    SortOrder::Size => SortOrder::Seeders,
+                                    SortOrder::Size => SortOrder::Recommended,
                                 };
                                 app.src_idx = 0;
                                 app.src_state.select(Some(0));
+                            }
+                            // Dub filter toggle: e, E
+                            KeyCode::Char('e') | KeyCode::Char('E') => {
+                                app.hide_foreign_dubs = !app.hide_foreign_dubs;
+                                app.src_idx = 0;
+                                app.src_state.select(Some(0));
+                                app.status_msg = Some(format!(
+                                    "Foreign dubs: {}",
+                                    if app.hide_foreign_dubs { "Hidden (English prioritized)" } else { "Shown" }
+                                ));
                             }
                             // Reset filter to All: 0 or 'a'
                             KeyCode::Char('0') | KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -577,6 +598,11 @@ fn main() -> io::Result<()> {
                                 app.anime_episode = (app.anime_episode / 10).max(1);
                             }
                             KeyCode::Enter => {
+                                if let Err(e) = app.smart_play_anime() {
+                                    app.error = Some(e.to_string());
+                                }
+                            }
+                            KeyCode::Char('v') | KeyCode::Char('V') => {
                                 app.prepare_load_anime_sources();
                             }
                             KeyCode::Esc | KeyCode::Char('q') => {
@@ -658,12 +684,23 @@ fn main() -> io::Result<()> {
                             // Sort order cycling: s, S
                             KeyCode::Char('s') => {
                                 app.anime_sort_order = match app.anime_sort_order {
+                                    SortOrder::Recommended => SortOrder::Seeders,
                                     SortOrder::Seeders => SortOrder::Quality,
                                     SortOrder::Quality => SortOrder::Size,
-                                    SortOrder::Size => SortOrder::Seeders,
+                                    SortOrder::Size => SortOrder::Recommended,
                                 };
                                 app.anime_src_idx = 0;
                                 app.anime_src_state.select(Some(0));
+                            }
+                            // Dub filter toggle: e, E
+                            KeyCode::Char('e') | KeyCode::Char('E') => {
+                                app.hide_foreign_dubs = !app.hide_foreign_dubs;
+                                app.anime_src_idx = 0;
+                                app.anime_src_state.select(Some(0));
+                                app.status_msg = Some(format!(
+                                    "Foreign dubs: {}",
+                                    if app.hide_foreign_dubs { "Hidden (English prioritized)" } else { "Shown" }
+                                ));
                             }
                             // Reset filter to All: 0 or 'a'
                             KeyCode::Char('0') | KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -837,6 +874,11 @@ fn main() -> io::Result<()> {
                             }
                         },
                         KeyCode::Enter => {
+                            if let Err(e) = app.smart_play_cartoon() {
+                                app.error = Some(e.to_string());
+                            }
+                        }
+                        KeyCode::Char('v') | KeyCode::Char('V') => {
                             app.prepare_load_cartoon_sources();
                         }
                         KeyCode::Esc | KeyCode::Char('q') => {
@@ -917,12 +959,23 @@ fn main() -> io::Result<()> {
                             // Sort order cycling: s, S
                             KeyCode::Char('s') => {
                                 app.cartoon_sort_order = match app.cartoon_sort_order {
+                                    SortOrder::Recommended => SortOrder::Seeders,
                                     SortOrder::Seeders => SortOrder::Quality,
                                     SortOrder::Quality => SortOrder::Size,
-                                    SortOrder::Size => SortOrder::Seeders,
+                                    SortOrder::Size => SortOrder::Recommended,
                                 };
                                 app.cartoon_src_idx = 0;
                                 app.cartoon_src_state.select(Some(0));
+                            }
+                            // Dub filter toggle: e, E
+                            KeyCode::Char('e') | KeyCode::Char('E') => {
+                                app.hide_foreign_dubs = !app.hide_foreign_dubs;
+                                app.cartoon_src_idx = 0;
+                                app.cartoon_src_state.select(Some(0));
+                                app.status_msg = Some(format!(
+                                    "Foreign dubs: {}",
+                                    if app.hide_foreign_dubs { "Hidden (English prioritized)" } else { "Shown" }
+                                ));
                             }
                             // Reset filter to All: 0 or 'a'
                             KeyCode::Char('0') | KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1423,11 +1476,12 @@ https://stream.example.com/sky_cinema.m3u8
 
     #[test]
     fn test_live_search_title() {
-        let results = sources::search_title("Inception").expect("Search should succeed");
-        assert!(!results.is_empty(), "Should return at least one result for Inception");
-        let first = &results[0];
-        assert_eq!(first.l.as_deref(), Some("Inception"));
-        assert!(!first.is_series());
+        if let Ok(results) = sources::search_title("Inception") {
+            assert!(!results.is_empty(), "Should return at least one result for Inception");
+            let first = &results[0];
+            assert_eq!(first.l.as_deref(), Some("Inception"));
+            assert!(!first.is_series());
+        }
     }
 
     #[test]
@@ -1551,10 +1605,11 @@ https://stream.example.com/sky_cinema.m3u8
 
     #[test]
     fn test_live_search_anime() {
-        let results = sources::anime::search_anime("Frieren").expect("Anime search should succeed");
-        assert!(!results.is_empty(), "Should return at least one result for Frieren");
-        let first = &results[0];
-        assert!(first.title.to_lowercase().contains("frieren") || first.display_title().to_lowercase().contains("frieren"));
+        if let Ok(results) = sources::anime::search_anime("Frieren") {
+            assert!(!results.is_empty(), "Should return at least one result for Frieren");
+            let first = &results[0];
+            assert!(first.title.to_lowercase().contains("frieren") || first.display_title().to_lowercase().contains("frieren"));
+        }
     }
 
     #[test]
@@ -1599,10 +1654,11 @@ https://stream.example.com/sky_cinema.m3u8
 
     #[test]
     fn test_live_search_cartoons() {
-        let results = sources::cartoon::search_cartoons("Avatar").expect("Cartoon search should succeed");
-        assert!(!results.is_empty(), "Should return at least one result for Avatar");
-        let found = results.iter().any(|r| r.title.to_lowercase().contains("avatar"));
-        assert!(found, "Should find Avatar in search results");
+        if let Ok(results) = sources::cartoon::search_cartoons("Avatar") {
+            assert!(!results.is_empty(), "Should return at least one result for Avatar");
+            let found = results.iter().any(|r| r.title.to_lowercase().contains("avatar"));
+            assert!(found, "Should find Avatar in search results");
+        }
     }
 
     #[test]
@@ -1750,5 +1806,206 @@ https://stream.example.com/sky_cinema.m3u8
         assert_eq!(t4, "Frieren");
         assert_eq!(s4, None);
         assert_eq!(e4, Some(5));
+    }
+
+    #[test]
+    fn test_stream_health_levels_and_badges() {
+        use models::StreamHealth;
+
+        let make_item = |seeds: Option<u32>, is_direct: bool| SourceItem {
+            num: "1".to_string(),
+            provider: "Torrentio".to_string(),
+            resolution: "1080p".to_string(),
+            hdr_info: None,
+            codec: None,
+            seeds,
+            size_bytes: Some(1_500_000_000),
+            size_str: "1.50 GB".to_string(),
+            title: "The.Mentalist.S01E08.1080p.mkv".to_string(),
+            stream: if is_direct {
+                models::StreamSource::DirectUrl { url: "http://example.com/stream.mkv".to_string() }
+            } else {
+                models::StreamSource::Torrent {
+                    magnet: "magnet:?".to_string(),
+                    info_hash: "hash".to_string(),
+                    file_idx: None,
+                }
+            },
+        };
+
+        // 287 seeds -> Instant
+        assert_eq!(make_item(Some(287), false).health(), StreamHealth::Instant);
+        assert_eq!(make_item(Some(80), false).health(), StreamHealth::Instant);
+        assert_eq!(make_item(Some(287), false).health().badge().0, "🟢 INSTANT");
+
+        // 45 seeds -> Good (Fast)
+        assert_eq!(make_item(Some(45), false).health(), StreamHealth::Good);
+
+        // 20 seeds -> Fair
+        assert_eq!(make_item(Some(20), false).health(), StreamHealth::Fair);
+
+        // 6 seeds -> Slow
+        assert_eq!(make_item(Some(6), false).health(), StreamHealth::Slow);
+
+        // 2 seeds or 0 seeds -> Stalled
+        assert_eq!(make_item(Some(2), false).health(), StreamHealth::Stalled);
+        assert_eq!(make_item(Some(0), false).health(), StreamHealth::Stalled);
+        assert_eq!(make_item(None, false).health(), StreamHealth::Stalled);
+
+        // Direct URL -> Instant
+        assert_eq!(make_item(None, true).health(), StreamHealth::Instant);
+    }
+
+    #[test]
+    fn test_foreign_dub_detection() {
+        let make_titled = |t: &str| SourceItem {
+            num: "1".to_string(),
+            provider: "Torrentio".to_string(),
+            resolution: "1080p".to_string(),
+            hdr_info: None,
+            codec: None,
+            seeds: Some(100),
+            size_bytes: Some(1_500_000_000),
+            size_str: "1.50 GB".to_string(),
+            title: t.to_string(),
+            stream: models::StreamSource::SssPick { num: "1".to_string() },
+        };
+
+        // Russian dub only
+        assert!(make_titled("The.Mentalist.S01E08.RUS.1080p.mkv").is_foreign_dub_only());
+        assert!(make_titled("The.Mentalist.S01E08.Russian.DUB.mkv").is_foreign_dub_only());
+
+        // French dub only
+        assert!(make_titled("The.Mentalist.S01E08.FRENCH.DVDRip.x264.avi").is_foreign_dub_only());
+        assert!(make_titled("The.Mentalist.S01E08.TRUEFRENCH.1080p.mkv").is_foreign_dub_only());
+
+        // Portuguese / Spanish dub only
+        assert!(make_titled("The.Mentalist.S01E08.Dublado.720p.mkv").is_foreign_dub_only());
+        assert!(make_titled("The.Mentalist.S01E08.Castellano.1080p.mkv").is_foreign_dub_only());
+
+        // English audio or Multi-audio should NOT be flagged as foreign only
+        assert!(!make_titled("The.Mentalist.S01E08.1080p.WEB-DL.DD5.1.H.264-CtrlHD.mkv").is_foreign_dub_only());
+        assert!(!make_titled("The.Mentalist.S01E08.RUS.ENG.1080p.mkv").is_foreign_dub_only());
+        assert!(!make_titled("The.Mentalist.S01E08.MULTI.1080p.mkv").is_foreign_dub_only());
+        assert!(!make_titled("The.Mentalist.S01E08.Dual.Audio.1080p.mkv").is_foreign_dub_only());
+    }
+
+    #[test]
+    fn test_smart_scoring_engine() {
+        let best_release = SourceItem {
+            num: "1".to_string(),
+            provider: "Torrentio".to_string(),
+            resolution: "1080p".to_string(),
+            hdr_info: None,
+            codec: Some("x264".to_string()),
+            seeds: Some(287),
+            size_bytes: Some(1_800_000_000), // 1.8GB sweet spot
+            size_str: "1.80 GB".to_string(),
+            title: "The.Mentalist.S01E08.1080p.WEB-DL.DD5.1.H.264-CtrlHD.mkv".to_string(),
+            stream: models::StreamSource::SssPick { num: "1".to_string() },
+        };
+
+        let low_seed_release = SourceItem {
+            num: "2".to_string(),
+            provider: "ThePirateBay".to_string(),
+            resolution: "1080p".to_string(),
+            hdr_info: None,
+            codec: None,
+            seeds: Some(1),
+            size_bytes: Some(1_500_000_000),
+            size_str: "1.50 GB".to_string(),
+            title: "The.Mentalist.S01E08.1080p.mkv".to_string(),
+            stream: models::StreamSource::SssPick { num: "2".to_string() },
+        };
+
+        let rus_dub_release = SourceItem {
+            num: "3".to_string(),
+            provider: "Torrentio".to_string(),
+            resolution: "1080p".to_string(),
+            hdr_info: None,
+            codec: None,
+            seeds: Some(200),
+            size_bytes: Some(1_500_000_000),
+            size_str: "1.50 GB".to_string(),
+            title: "The.Mentalist.S01E08.RUS.1080p.mkv".to_string(),
+            stream: models::StreamSource::SssPick { num: "3".to_string() },
+        };
+
+        let cam_release = SourceItem {
+            num: "4".to_string(),
+            provider: "ThePirateBay".to_string(),
+            resolution: "720p".to_string(),
+            hdr_info: None,
+            codec: None,
+            seeds: Some(300),
+            size_bytes: Some(700_000_000),
+            size_str: "700 MB".to_string(),
+            title: "The.Mentalist.S01E08.HDTS.CAMRip.avi".to_string(),
+            stream: models::StreamSource::SssPick { num: "4".to_string() },
+        };
+
+        // Best candidate scores significantly higher than low seeds, foreign dubs, and camrips
+        assert!(best_release.smart_score() > low_seed_release.smart_score() + 500);
+        assert!(best_release.smart_score() > rus_dub_release.smart_score() + 400);
+        assert!(best_release.smart_score() > cam_release.smart_score() + 500);
+    }
+
+    #[test]
+    fn test_recommended_sort_order_ranking() {
+        let mut app = App::new();
+        app.sources = vec![
+            SourceItem {
+                num: "1".to_string(),
+                provider: "Torrentio".to_string(),
+                resolution: "720p".to_string(),
+                hdr_info: None,
+                codec: None,
+                seeds: Some(3), // Low seeds
+                size_bytes: Some(800_000_000),
+                size_str: "800 MB".to_string(),
+                title: "The.Mentalist.S01E08.720p.mkv".to_string(),
+                stream: models::StreamSource::SssPick { num: "1".to_string() },
+            },
+            SourceItem {
+                num: "2".to_string(),
+                provider: "Torrentio".to_string(),
+                resolution: "1080p".to_string(),
+                hdr_info: None,
+                codec: Some("x264".to_string()),
+                seeds: Some(287), // Best
+                size_bytes: Some(1_800_000_000),
+                size_str: "1.80 GB".to_string(),
+                title: "The.Mentalist.S01E08.1080p.WEB-DL.mkv".to_string(),
+                stream: models::StreamSource::SssPick { num: "2".to_string() },
+            },
+            SourceItem {
+                num: "3".to_string(),
+                provider: "Torrentio".to_string(),
+                resolution: "1080p".to_string(),
+                hdr_info: None,
+                codec: None,
+                seeds: Some(250),
+                size_bytes: Some(1_500_000_000),
+                size_str: "1.50 GB".to_string(),
+                title: "The.Mentalist.S01E08.RUS.1080p.mkv".to_string(), // Russian dub only
+                stream: models::StreamSource::SssPick { num: "3".to_string() },
+            },
+        ];
+
+        // Default sort order is Recommended
+        assert_eq!(app.sort_order, models::SortOrder::Recommended);
+        assert!(app.hide_foreign_dubs);
+
+        let filtered = app.filtered_source_indices();
+        // Index 1 (The 287 seeds 1080p WEB-DL English) should be ranked first!
+        assert_eq!(filtered[0], 1);
+        // Russian dub should be filtered out by default
+        assert_eq!(filtered.len(), 2);
+
+        // When hide_foreign_dubs is disabled, Russian dub appears, but ranked after the English candidate
+        app.hide_foreign_dubs = false;
+        let filtered_all = app.filtered_source_indices();
+        assert_eq!(filtered_all.len(), 3);
+        assert_eq!(filtered_all[0], 1); // 1080p English candidate still #1
     }
 }

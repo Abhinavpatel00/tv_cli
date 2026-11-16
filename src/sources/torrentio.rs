@@ -4,7 +4,7 @@ use std::env;
 use std::process::Command;
 use std::time::Duration;
 
-const SSS: &str = "/home/lk/webseries/sss.txt";
+const SSS: &str = "./sss.txt";
 const DEFAULT_TORRENTIO: &str = "https://torrentio.strem.fun";
 
 #[derive(Deserialize, Debug)]
@@ -321,7 +321,9 @@ fn fallback_list_sources(
     ttid: &str,
     episode_info: Option<(u32, u32)>,
 ) -> Vec<SourceItem> {
-    let sss_path = env::var("SSS_PATH").unwrap_or_else(|_| SSS.to_string());
+    let sss_path = crate::player::find_sss_executable()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| SSS.to_string());
     let mut cmd = Command::new(&sss_path);
     cmd.arg("id").arg(ttid);
 

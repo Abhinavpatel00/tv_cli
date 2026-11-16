@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-const SSS: &str = "/home/lk/webseries/sss.txt";
 const OPENSUBS: &str = "https://opensubtitles-v3.strem.io/subtitles";
 
 pub fn get_history_file_path() -> PathBuf {
@@ -58,24 +57,59 @@ pub fn find_sss_executable() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let default_path = PathBuf::from(SSS);
-    if default_path.exists() {
-        return Some(default_path);
-    }
-    for candidate in &["./sss.txt", "../sss.txt", "./sss"] {
+
+    // 1. Check relative to current working directory
+    for candidate in &["./sss.txt", "./sss", "../sss.txt", "../sss"] {
         let path = PathBuf::from(candidate);
-        if path.exists() {
+        if path.is_file() {
+            if let Ok(abs) = path.canonicalize() {
+                return Some(abs);
+            }
             return Some(path);
         }
     }
+
+    // 2. Check relative to executable binary
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            for candidate in &["sss.txt", "sss", "../sss.txt", "../../sss.txt"] {
+                let path = exe_dir.join(candidate);
+                if path.is_file() {
+                    if let Ok(abs) = path.canonicalize() {
+                        return Some(abs);
+                    }
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    // 3. Known project paths
+    for candidate in &[
+        "/home/lk/webseries/tsss-tui/sss.txt",
+        "/home/lk/webseries/sss.txt",
+        "/usr/local/bin/sss",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    // 4. System PATH
     if let Ok(path_var) = env::var("PATH") {
         for dir in env::split_paths(&path_var) {
             let full = dir.join("sss");
             if full.is_file() {
                 return Some(full);
             }
+            let full_txt = dir.join("sss.txt");
+            if full_txt.is_file() {
+                return Some(full_txt);
+            }
         }
     }
+
     None
 }
 
@@ -225,6 +259,10 @@ pub fn play_source(
 
     if let Some(sub) = &sub_file {
         cmd.env("SUBS_FILE", sub.to_string_lossy().to_string());
+    }
+
+    if env::var("SSS_TORRENT_WAIT").is_err() {
+        cmd.env("SSS_TORRENT_WAIT", "18");
     }
 
     let status = cmd.status();

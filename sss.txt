@@ -1,0 +1,968 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  sss - Super Simple Streamer
+#  One bash file: find something, then throw it straight at mpv/ffplay in your
+#  terminal. No browser, no pop-ups, no ad-blocker needed.
+#
+#  Sources that resolve without a JS engine:
+#    torrentio   movie/TV by IMDb id -> magnet -> streamed over HTTP
+#    iptv        11k+ free live channels (HLS) from iptv-org
+#    archive     public-domain movies from archive.org (direct mp4, seekable)
+#    subtitles   opensubtitles (via stremio), auto-attached in mpv
+#
+#  Why not the sites themselves (bingebang, zoechip, vidlink, vidsrc...)?
+#  Their players only hand the real m3u8 to a browser, behind obfuscated JS,
+#  per-5-minute rotating domains and WASM/ChaCha20 URL decryption. There is no
+#  static URL for bash to grep, and it changes weekly. torrentio serves the
+#  same kind of catalogue as plain JSON, so bash can read it. If you run your
+#  own headless resolver, plug it in with --resolver-cmd.
+#
+#  Requires: bash 4+, curl, jq, python3 (with libtorrent bindings)
+#  Optional: mpv, ffplay
+# ============================================================================
+
+set -uo pipefail
+
+VERSION="1.2.0"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/sss"
+IPTV_URL="https://iptv-org.github.io/iptv/index.m3u"
+TORRENTIO="${SSS_TORRENTIO:-https://torrentio.strem.fun}"
+CINEMETA="https://v3-cinemeta.strem.io/meta"
+OPENSUBS="https://opensubtitles-v3.strem.io/subtitles"
+IMDB_SUG="https://v3.sg.media-imdb.com/suggestion/x/%s.json"
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+
+PLAYER="${SSS_PLAYER:-auto}"     # auto | mpv | ffplay | paper
+QUALITY="${SSS_QUALITY:-}"       # 2160 | 1080 | 720 | 480
+SUBS_LANG="${SSS_SUBS:-eng}"     # language code, or "off"
+TYPE="movie"
+SEASON=""
+EPISODE=""
+LIST_ONLY=0
+TTY_MODE=0
+RANDOM_PICK=0
+RESOLVER_CMD=""
+CMD=""
+SUBS_FILE=""
+R_ID=""; R_KIND=""; R_NAME=""
+
+# ---------------------------------------------------------------- output ----
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+  CY=$'\033[36m'; GR=$'\033[32m'; YE=$'\033[33m'; RD=$'\033[31m'; MG=$'\033[35m'
+else
+  B=""; D=""; R=""; CY=""; GR=""; YE=""; RD=""; MG=""
+fi
+info() { printf '%s::%s %s\n' "$CY" "$R" "$*" >&2; }
+ok()   { printf '%s::%s %s\n' "$GR" "$R" "$*" >&2; }
+warn() { printf '%s!!%s %s\n' "$YE" "$R" "$*" >&2; }
+die()  { printf '%sxx%s %s\n' "$RD" "$R" "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+need() {
+  local m=() t
+  for t in curl jq python3; do have "$t" || m+=("$t"); done
+  if ((${#m[@]})); then
+    printf '%sxx%s missing required tool(s): %s\n' "$RD" "$R" "${m[*]}" >&2
+    printf '    Debian/Ubuntu: sudo apt install %s\n    macOS: brew install %s\n' \
+      "${m[*]}" "${m[*]}" >&2
+    exit 1
+  fi
+  return 0
+}
+
+usage() {
+  cat <<'EOF'
+sss - Super Simple Streamer (bash -> mpv/ffplay)
+
+USAGE
+  sss <title>                          search, pick, play (movie or show)
+  sss tv <title> [season] [episode]     force series
+  sss id <tt1234567>                    play straight from an IMDb id
+  sss iptv [keyword]                    free live channels (HLS)
+  sss archive <keyword>                 public-domain movies, direct mp4
+  sss magnet "<magnet|infohash>"        play a torrent you already have
+  sss url <url>                         play any URL or local file
+  sss setup                             check python3/libtorrent are present
+  sss doctor                            check what's installed
+  sss selftest                          hit every source and report
+
+OPTIONS
+  -p, --player <name>   mpv | ffplay | paper   (default: auto)
+  -q, --quality <res>   2160 | 1080 | 720 | 480              (default: any)
+      --tty             render as ASCII art inside the terminal
+      --list            list sources instead of playing
+      --random          pick a source without asking
+      --no-subs         do not fetch subtitles
+      --subs <lang>     subtitle language code (default: eng)
+      --resolver-cmd C  custom resolver: C gets "<type> <imdbid> [s e]" on
+                        argv and must print one playable URL per line
+  -h, --help            this text
+  -v, --version         version
+
+ENV
+  SSS_PLAYER, SSS_QUALITY, SSS_SUBS, SSS_TORRENTIO, SSS_PICK, SSS_ANSWER,
+  SSS_TIMEOUT, SSS_TORRENT_WAIT (seconds to wait for peers) also work.
+  SSS_PICK=N / SSS_ANSWER="2 5" make the menus non-interactive, which is
+  handy in scripts.
+
+EXAMPLES
+  sss "inception"
+  sss tv "the bear" 2 5
+  sss id tt1375666 --list
+  sss iptv pluto --random
+  sss archive "night of the living dead" -q 480
+  sss magnet "magnet:?xt=urn:btih:..."
+  sss url https://example.com/live.m3u8 --tty
+EOF
+}
+
+# ---------------------------------------------------------------- helpers ---
+get() { # get URL [extra curl args...]
+  local url="$1"; shift
+  curl -sSL --compressed -A "$UA" -m "${SSS_TIMEOUT:-30}" \
+    -H 'Accept: application/json, text/plain, */*' "$@" "$url" 2>/dev/null
+}
+
+urlencode() { jq -rn --arg s "$1" '$s|@uri'; }
+
+read_tty() { # read_tty VARNAME - real terminal when one is attached
+  local __v="$1"
+  if ( : </dev/tty ) 2>/dev/null; then
+    IFS= read -r "$__v" </dev/tty || return 1
+  else
+    IFS= read -r "$__v" || return 1
+  fi
+}
+
+random_index() { awk -v n="$1" 'BEGIN{ srand(); print int(rand()*n) }'; }
+
+# pick_index "prompt" < newline-delimited labels -> prints 0-based index
+pick_index() {
+  local prompt="${1:-choose}" line sel i
+  local lines=()
+  while IFS= read -r line; do lines+=("$line"); done
+  ((${#lines[@]})) || return 1
+
+  if [ -n "${SSS_PICK:-}" ]; then          # non-interactive escape hatch
+    case "$SSS_PICK" in
+      *[!0-9]*) warn "SSS_PICK must be a number"; return 1 ;;
+    esac
+    if ((SSS_PICK >= 1 && SSS_PICK <= ${#lines[@]})); then
+      echo $((SSS_PICK - 1)); return 0
+    fi
+    warn "SSS_PICK=${SSS_PICK} out of range (1..${#lines[@]})"; return 1
+  fi
+  if ((${#lines[@]} == 1)); then echo 0; return 0; fi
+
+  while :; do
+    printf '%s%s%s\n' "$B" "$prompt" "$R" >&2
+    for i in "${!lines[@]}"; do
+      printf '  %s%2d%s %s\n' "$CY" "$((i + 1))" "$R" "${lines[$i]}" >&2
+    done
+    printf '  %s q%s quit\n' "$D" "$R" >&2
+    printf '%s> %s' "$MG" "$R" >&2
+    read_tty sel || return 1
+    case "$sel" in
+      q|Q|quit|exit) return 1 ;;
+      '') continue ;;
+      *[!0-9]*) warn "numbers only, or q to quit" ;;
+      *)
+        if ((sel >= 1 && sel <= ${#lines[@]})); then
+          echo $((sel - 1)); return 0
+        fi
+        warn "no entry $sel" ;;
+    esac
+  done
+}
+
+detect_player() {
+  case "$PLAYER" in
+    auto)
+      if have mpv; then echo mpv
+      elif have ffplay; then echo ffplay
+      else echo paper; fi ;;
+    *) echo "$PLAYER" ;;
+  esac
+}
+
+# ------------------------------------------------------------- native server --
+# webtorrent is electron (heavy RAM, native-module breakage). We instead serve
+# the selected file from the torrent over localhost HTTP with range support,
+# using the system libtorrent-rasterbar binding (arvidn's libtorrent, native
+# C++ via python3-libtorrent) — tiny footprint, no electron.
+NT_SERVER="$CACHE_DIR/native_torrent.py"
+NT_OUT="$CACHE_DIR/nt.out"
+NT_READY="$CACHE_DIR/nt.ready"
+NTPID=""
+
+write_native_server() {
+  [ -s "$NT_SERVER" ] && return 0
+  mkdir -p "$CACHE_DIR"
+  cat >"$NT_SERVER" <<'PYEOF'
+#!/usr/bin/env python3
+# native_torrent.py - serve one file from a torrent over HTTP (range support)
+# using native libtorrent-rasterbar (arvidn/libtorrent, C++) via python bindings.
+# libtorrent downloads the target file sequentially to disk; we serve whatever
+# is already on disk, waiting per-piece via have_piece so ranges are complete.
+# No electron, no node.
+# Usage: native_torrent.py <magnet> <file_idx> <bind_port(0=ephemeral)>
+# prints "READY <size> <port> <path>" on stdout when addressable,
+# or "READY-FAILED <reason>" and exits 1.
+import sys, os, re, time
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+import libtorrent as lt
+
+MAGNET, FILE_IDX, BIND_PORT = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+timeout = int(os.environ.get("NT_TIMEOUT", "120"))
+cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")) + "/sss"
+params = lt.parse_magnet_uri(MAGNET)
+params.save_path = cache
+params.storage_mode = lt.storage_mode_t.storage_mode_sparse
+ses = lt.session({"enable_dht": True, "enable_lsd": True, "listen_interfaces": "0.0.0.0:0"})
+h = ses.add_torrent(params)
+
+deadline = time.time() + timeout
+while not h.status().has_metadata:
+    if time.time() > deadline:
+        print("READY-FAILED no metadata", flush=True); sys.exit(1)
+    time.sleep(0.1)
+
+tf = h.torrent_file()
+files = tf.files()
+if FILE_IDX < 0 or FILE_IDX >= files.num_files():
+    print(f"READY-FAILED file {FILE_IDX} out of range (0..{files.num_files()-1})", flush=True); sys.exit(1)
+file_path = files.file_path(FILE_IDX)
+file_size = files.file_size(FILE_IDX)
+file_offset = files.file_offset(FILE_IDX)
+piece_len = tf.piece_length()
+disk_path = os.path.join(cache, file_path)
+
+# download only the target file, sequentially (good for streaming)
+for i in range(files.num_files()):
+    h.file_priority(i, 1 if i == FILE_IDX else 0)
+h.set_flags(lt.torrent_flags.sequential_download)
+
+first_piece = file_offset // piece_len
+last_piece = (file_offset + file_size - 1) // piece_len
+MAX_CHUNK = 4 * 1024 * 1024  # don't make the client wait for huge ranges
+
+# wait until the first piece of the target file lands on disk, so the file
+# actually exists before we announce READY
+t0 = time.time()
+while time.time() - t0 < timeout and not h.have_piece(first_piece):
+    time.sleep(0.1)
+if not h.have_piece(first_piece):
+    print("READY-FAILED first piece not downloaded in time", flush=True); sys.exit(1)
+
+
+def contiguous_available():
+    """absolute offset (exclusive) of the contiguously-downloaded prefix
+    starting at file_offset; pieces arrive in order due to sequential_download"""
+    upto = file_offset
+    p = first_piece
+    while p <= last_piece and h.have_piece(p):
+        upto = min(file_offset + file_size, (p + 1) * piece_len)
+        p += 1
+    return upto
+
+
+def wait_piece(piece_idx, timeout=12):
+    if h.have_piece(piece_idx):
+        return True
+    end = time.time() + timeout
+    while time.time() < end:
+        if h.have_piece(piece_idx):
+            return True
+        time.sleep(0.05)
+    return h.have_piece(piece_idx)
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send_range(self, start, end):
+        if start < 0: start = 0
+        if end > file_size: end = file_size
+        if start >= end:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{file_size}")
+            self.end_headers()
+            return
+        # never serve more than MAX_CHUNK in one response: mpv opens with no
+        # Range header (= whole file), so we must not wait for every piece
+        if end - start > MAX_CHUNK:
+            end = start + MAX_CHUNK
+        abs_start = file_offset + start
+        abs_end = file_offset + end
+        p0 = abs_start // piece_len
+        p1 = (abs_end - 1) // piece_len
+        # fetch every piece this range touches on demand (libtorrent
+        # prioritizes pieces with the earliest deadlines first), so seeking
+        # anywhere works: blocks only until the needed pieces arrive
+        for p in range(p0, p1 + 1):
+            h.set_piece_deadline(p, 0)
+        for p in range(p0, p1 + 1):
+            if not wait_piece(p, 60):
+                self.send_response(503)
+                self.send_header("Retry-After", "10")
+                self.end_headers()
+                return
+        total = end - start
+        out = bytearray()
+        with open(disk_path, "rb") as fh:
+            fh.seek(start)
+            out += fh.read(total)
+        self.send_response(206)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Range", f"bytes {start}-{end-1}/{file_size}")
+        self.send_header("Content-Length", str(total))
+        self.send_header("Content-Type", "video/mp4")
+        self.end_headers()
+        self.wfile.write(bytes(out))
+
+    def do_GET(self):
+        m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if m:
+            a = int(m.group(1)) if m.group(1) else 0
+            b = int(m.group(2)) if m.group(2) else file_size - 1
+            self._send_range(a, b + 1)
+        else:
+            self._send_range(0, file_size)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Content-Type", "video/mp4")
+        self.end_headers()
+
+# create the HTTP server so we know the actual port, then announce READY
+srv = ThreadingHTTPServer(("127.0.0.1", BIND_PORT), H)
+actual_port = srv.server_address[1]
+print(f"READY {file_size} {actual_port} {file_path}", flush=True)
+srv.serve_forever()
+PYEOF
+  chmod +x "$NT_SERVER"
+}
+
+nt_wait_ready() { # sets NT_PORT NT_SIZE NT_PATH globals; returns 0 on success
+  NT_PORT=""; NT_SIZE=""; NT_PATH=""
+  local i line
+  for ((i = 0; i < ${SSS_TORRENT_WAIT:-60}; i++)); do
+    sleep 1
+    [ -s "$NT_READY" ] || continue
+    line=$(cat "$NT_READY")
+    case "$line" in
+      READY-FAILED\ *)
+        warn "${line#READY-FAILED }"; return 1 ;;
+      READY\ *)
+        read -r _ NT_SIZE NT_PORT NT_PATH <<< "$line"
+        [ -n "$NT_PORT" ] || { warn "native server didn't report a port"; return 1; }
+        return 0 ;;
+    esac
+    kill -0 "$NTPID" 2>/dev/null || { wait "$NTPID"; die "native torrent server exited: $(tail -5 "$NT_OUT")"; }
+  done
+  warn "no peers after ${SSS_TORRENT_WAIT:-60}s (dead torrent / ISP blocking / overloaded tracker)."
+  warn "try again, raise SSS_TORRENT_WAIT, or -p paper to copy the magnet elsewhere."
+  return 1
+}
+
+# ------------------------------------------------------------- IMDb lookup --
+imdb_search() { # title -> "id<TAB>kind<TAB>year<TAB>name"
+  local q="$1" enc
+  enc=$(urlencode "$q")
+  get "$(printf "$IMDB_SUG" "$enc")" |
+    jq -r '(.d // [])[]
+      | select(.id|test("^tt[0-9]+$"))
+      | select((.qid//.q//"") | test("^(video|short|videoGame|podcastSeries)$")|not)
+      | [.id, (.qid//.q//"?"), ((.y//.yr//"----")|tostring), (.l//"?")] | @tsv' 2>/dev/null |
+    awk -F'\t' '!seen[$1]++' | head -12
+}
+
+resolve_title() { # title -> R_ID / R_KIND / R_NAME
+  local q="$1" lines menu idx row
+  lines=$(imdb_search "$q")
+  [ -n "$lines" ] || die "nothing on IMDb matches \"$q\""
+
+  if [ "$(printf '%s\n' "$lines" | wc -l | tr -d ' ')" -gt 1 ]; then
+    menu=$(printf '%s\n' "$lines" | awk -F'\t' '{
+      k=$2; if (k ~ /[Ss]eries|TV/) k="series";
+      printf "%-10s %-9s %-6s %s\n", $1, k, $3, $4 }')
+    idx=$(printf '%s\n' "$menu" | pick_index "Matches for \"$q\" (id / kind / year / title):") || exit 0
+    row=$(printf '%s\n' "$lines" | sed -n "$((idx + 1))p")
+    R_ID=$(printf '%s' "$row" | cut -f1)
+    R_KIND=$(printf '%s' "$row" | cut -f2)
+    R_NAME=$(printf '%s' "$row" | cut -f4)
+  else
+    R_ID=$(printf '%s\n' "$lines" | cut -f1)
+    R_KIND=$(printf '%s\n' "$lines" | cut -f2)
+    R_NAME=$(printf '%s\n' "$lines" | cut -f4)
+  fi
+  case "$R_KIND" in
+    *[Ss]eries*|*TV*) R_KIND="series" ;;
+    *) R_KIND="movie" ;;
+  esac
+}
+
+ask_episode() {
+  local ans
+  [ -n "$SEASON" ] && [ -n "$EPISODE" ] && return 0
+  if [ -n "${SSS_ANSWER:-}" ]; then
+    ans="$SSS_ANSWER"
+  else
+    printf '%sseason episode%s (e.g. "2 5", blank = 1 1): ' "$MG" "$R" >&2
+    read_tty ans || ans=""
+  fi
+  ans="${ans:-1 1}"
+  SEASON="${SEASON:-${ans%% *}}"
+  EPISODE="${EPISODE:-${ans##* }}"
+  SEASON="${SEASON:-1}"; EPISODE="${EPISODE:-1}"
+}
+
+# --------------------------------------------------------------- subtitles --
+subs_fetch() { # subs_fetch KIND ID SEASON EPISODE -> sets SUBS_FILE
+  local kind="$1" id="$2" s="$3" e="$4"
+  local keypath key out payload url
+  SUBS_FILE=""
+  [ -z "$SUBS_LANG" ] && return 0
+  [ "$SUBS_LANG" = "off" ] && return 0
+
+  mkdir -p "$CACHE_DIR/subs"
+  if [ "$kind" = "series" ]; then
+    keypath="series/$id:$s:$e"; key="${id}_s${s}e${e}_$SUBS_LANG"
+  else
+    keypath="movie/$id"; key="${id}_$SUBS_LANG"
+  fi
+  out="$CACHE_DIR/subs/$key.srt"
+  if [ -s "$out" ]; then SUBS_FILE="$out"; info "subtitles: cached"; return 0; fi
+
+  payload=$(get "$OPENSUBS/$keypath.json")
+  url=$(printf '%s' "$payload" |
+    jq -r --arg L "$SUBS_LANG" '[.subtitles[]? | select(.lang == $L)][0].url // empty' 2>/dev/null)
+  [ -n "$url" ] || url=$(printf '%s' "$payload" |
+    jq -r '[.subtitles[]?][0].url // empty' 2>/dev/null)
+  [ -n "$url" ] || { warn "no subtitles found for $id"; return 1; }
+
+  if get "$url" > "$out.tmp" && [ -s "$out.tmp" ]; then
+    mv "$out.tmp" "$out"; SUBS_FILE="$out"; info "subtitles: $SUBS_LANG"
+  else
+    rm -f "$out.tmp"; warn "could not download subtitles"
+  fi
+}
+
+# ------------------------------------------------------------- how to play --
+play_url() { # play_url URL [title]
+  local url="$1" title="${2:-stream}" p
+  p=$(detect_player)
+  case "$p" in
+    paper)
+      printf '%s\n' "$url"; return 0 ;;
+    mpv)
+      have mpv || die "mpv not found (apt install mpv)"
+      local args=(--force-window=yes --keep-open=no --msg-level=all=warn
+                  --user-agent="$UA" --title="$title"
+                  --cache=yes --demuxer-max-bytes=200M --demuxer-readahead-secs=40)
+      [ -n "$SUBS_FILE" ] && args+=(--sub-file="$SUBS_FILE")
+      ((TTY_MODE)) && args+=(--vo=tct --really-quiet)
+      info "playing: $title"
+      mpv "${args[@]}" "$url"
+      ;;
+    ffplay)
+      have ffplay || die "ffplay not found (apt install ffmpeg)"
+      local args=(-loglevel warning -window_title "$title"
+                  -headers "User-Agent: $UA"$'\r\n')
+      [ -n "$SUBS_FILE" ] && warn "ffplay cannot load external subtitles; use -p mpv"
+      ((TTY_MODE)) && args+=(-vf scale=100:-1)
+      info "playing: $title"
+      ffplay "${args[@]}" -i "$url"
+      ;;
+    *) die "unknown player '$p' (mpv | ffplay | paper)" ;;
+  esac
+}
+
+# Torrents: serve the selected file over localhost HTTP with range support,
+# using a native libtorrent-rasterbar (arvidn/libtorrent) python server.
+# No electron / node. The server downloads only the target file, sequentially,
+# so seeking works via HTTP Range requests.
+_nt_fail() { # kill a running native server and report
+  if [ -n "${NTPID:-}" ] && kill -0 "$NTPID" 2>/dev/null; then
+    kill "$NTPID" 2>/dev/null; wait "$NTPID" 2>/dev/null
+  fi
+  NTPID=""
+}
+
+nt_start_server() { # nt_start_server MAGNET FILEIDX -> sets NT_PORT/NT_SIZE/NT_PATH
+  NT_PORT=""; NT_SIZE=""; NT_PATH=""
+  : >"$NT_READY"; : >"$NT_OUT"
+  NT_TIMEOUT="${SSS_TORRENT_WAIT:-120}" python3 "$NT_SERVER" "$1" "$2" 0 >"$NT_READY" 2>"$NT_OUT" &
+  NTPID=$!
+  nt_wait_ready || { _nt_fail; return 1; }
+  info "native torrent server on port $NT_PORT ($NT_SIZE bytes)"
+}
+
+play_magnet() { # play_magnet MAGNET TITLE [FILEIDX]
+  local magnet="$1" title="$2" fidx="${3:-}" p url args=() pargs=()
+  p=$(detect_player)
+  case "$p" in
+    paper)
+      printf '%s\n' "$magnet"; return 0 ;;
+    mpv)
+      have mpv || die "mpv not found (apt install mpv)"
+      write_native_server || die "could not write native torrent server"
+      info "starting native torrent server (buffering takes a few seconds)..."
+      nt_start_server "$magnet" "${fidx:-0}" || return 1
+      url="http://127.0.0.1:$NT_PORT/"
+      args=(--force-window=yes --keep-open=no --msg-level=all=warn
+            --user-agent="$UA" --title="$title"
+            --cache=yes --demuxer-max-bytes=200M --demuxer-readahead-secs=40)
+      [ -n "$SUBS_FILE" ] && args+=(--sub-file="$SUBS_FILE")
+      ((TTY_MODE)) && args+=(--vo=tct --really-quiet)
+      info "playing: $title"
+      mpv "${args[@]}" "$url"
+      local rc=$?
+      _nt_fail
+      return $rc ;;
+    ffplay)
+      have ffplay || die "ffplay not found (apt install ffmpeg)"
+      [ -n "$SUBS_FILE" ] && warn "ffplay cannot load external subtitles; use -p mpv"
+      write_native_server || die "could not write native torrent server"
+      info "starting native torrent server (buffering takes a few seconds)..."
+      nt_start_server "$magnet" "${fidx:-0}" || return 1
+      # ffplay can't be told to use a custom User-Agent easily; the native
+      # server needs no auth, so feed it the http url directly.
+      local shim="$CACHE_DIR/shim"
+      mkdir -p "$shim"
+      cat >"$shim/mpv" <<'SHIM'
+#!/usr/bin/env bash
+url=""
+for a in "$@"; do case "$a" in http://*|https://*) url="$a" ;; esac; done
+[ -n "$url" ] || exit 1
+exec ffplay -loglevel warning -window_title "sss" ${SSS_FFPLAY_EXTRA:-} -i "$url"
+SHIM
+      chmod +x "$shim/mpv"
+      local extra=""
+      ((TTY_MODE)) && extra="-vf scale=100:-1"
+      info "playing: $title"
+      env PATH="$shim:$PATH" SSS_FFPLAY_EXTRA="$extra" \
+        mpv --really-quiet --vo=null --ao=null "http://127.0.0.1:$NT_PORT/" >/dev/null 2>&1
+      # the above launches ffplay via the shim named "mpv"
+      local rc=$?
+      _nt_fail
+      return $rc ;;
+    *) die "unknown player '$p' (mpv | ffplay | paper)" ;;
+  esac
+}
+
+# --------------------------------------------------------------- torrentio --
+torrentio_json() { # kind id [s] [e]
+  local kind="$1" id="$2" s="${3:-}" e="${4:-}" key url cache
+  if [ "$kind" = "series" ]; then key="series/$id:$s:$e"; else key="movie/$id"; fi
+  url="$TORRENTIO/stream/$key.json"
+  mkdir -p "$CACHE_DIR"
+  cache="$CACHE_DIR/$(printf '%s' "$key" | tr '/:' '__').json"
+  if [ -s "$cache" ] && [ -z "${SSS_NO_CACHE:-}" ] &&
+     [ $(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) )) -lt 900 ]; then
+    cat "$cache"; return 0
+  fi
+  get "$url" -H "Origin: https://web.stremio.com" -H "Referer: https://web.stremio.com/" > "$cache"
+  if [ -s "$cache" ] && jq -e '.streams' "$cache" >/dev/null 2>&1; then
+    cat "$cache"
+  else
+    rm -f "$cache"; return 1
+  fi
+}
+
+parse_seeds()    { sed -n 's/.*👤[^0-9]*\([0-9][0-9]*\).*/\1/p'; }
+parse_size_gb()  {
+  sed -n 's/.*💾[[:space:]]*\([0-9][0-9.]*\)[[:space:]]*\([KMGT]B\).*/\1 \2/p' |
+    awk '{ v=$1; u=$2
+      if (u=="KB") v/=1048576; else if (u=="MB") v/=1024; else if (u=="TB") v*=1024
+      printf "%.2f", v }'
+}
+label_quality() {
+  printf '%s' "$1" | grep -oiE '2160p|4k|uhd|1080p|720p|480p|360p' | head -1 |
+    tr 'A-Z' 'a-z' |
+    sed -e 's/2160p/2160/' -e 's/4k/2160/' -e 's/uhd/2160/' \
+        -e 's/1080p/1080/' -e 's/720p/720/' -e 's/480p/480/' -e 's/360p/360/'
+}
+size_matches() { # fallback filter when the label says no resolution
+  local gb="$1" q="$2"
+  [ -z "$q" ] && return 0
+  awk -v gb="$gb" -v q="$q" 'BEGIN{
+    if (gb=="" || gb+0<=0) exit 0
+    lim = (q=="2160") ? 60 : (q=="1080") ? 25 : (q=="720") ? 8 : 3
+    exit !(gb+0 <= lim) }'
+}
+
+_rows_filter() { # want_q strict
+  local want_q="$1" strict="$2"
+  while IFS=$'\t' read -r ih fi fn nm ti tr; do
+    [ -n "$ih" ] || continue
+    local seeds gb lq label
+    seeds=$(printf '%s\n' "$ti" | parse_seeds); seeds="${seeds:-0}"
+    gb=$(printf '%s\n' "$ti" | parse_size_gb)
+    lq=$(label_quality "$nm")
+    if [ -n "$want_q" ]; then
+      if [ "$strict" = "1" ]; then
+        [ "$lq" = "$want_q" ] || continue
+      else
+        size_matches "$gb" "$want_q" || continue
+      fi
+    fi
+    label=$(printf '%s | seed:%-5s | %6s GB | %.56s' "$nm" "$seeds" "${gb:-?}" "$fn")
+    printf '%s\t%s\t%s\t%s\t%s\n' "$seeds" "$label" "$ih" "$fi" "$tr"
+  done
+}
+
+torrentio_rows() { # json want_q -> seeds/label/hash/fileidx/trackers
+  local json="$1" want_q="$2" raw pass1 pass2
+  raw=$(printf '%s' "$json" | jq -r '.streams[]? | [
+      (.infoHash // ""),
+      (.fileIdx // 0),
+      (.behaviorHints.filename // ""),
+      ((.name // "") | gsub("\\n"; " ")),
+      ((.title // "") | gsub("\\n"; " ")),
+      ((.sources // []) | map(select(startswith("tracker:")) | sub("^tracker:";"")) | join("|"))
+    ] | @tsv' 2>/dev/null)
+  pass1=$(printf '%s\n' "$raw" | _rows_filter "$want_q" 1)
+  if [ -n "$want_q" ] && [ -z "$pass1" ]; then
+    pass2=$(printf '%s\n' "$raw" | _rows_filter "$want_q" 0)
+    [ -n "$pass2" ] && { printf '%s\n' "$pass2"; return; }
+  fi
+  printf '%s\n' "$pass1"
+}
+
+# Public trackers used as a fallback: Torrentio sometimes returns only one, and
+# a single overloaded tracker (opentrackr) can leave us with zero peers while the
+# torrent is perfectly healthy.
+TRACKERS=(
+  udp://tracker.opentrackr.org:1337/announce
+  udp://open.stealth.si:80/announce
+  udp://tracker.tiny-vps.com:6969/announce
+  udp://tracker.torrent.eu.org:451/announce
+  udp://exodus.desync.com:6969/announce
+  udp://tracker.openbittorrent.com:6969/announce
+)
+
+magnet_for() {
+  local ih="$1" tr="$2" m="magnet:?xt=urn:btih:$ih&dn=sss" t
+  local -a all=()
+  if [ -n "$tr" ]; then
+    while IFS= read -r t; do
+      [ -n "$t" ] && all+=("$t")
+    done < <(printf '%s' "$tr" | tr '|' '\n')
+  fi
+  for t in "${TRACKERS[@]}"; do
+    printf '%s\n' "${all[@]}" | grep -qxF "$t" || all+=("$t")
+  done
+  for t in "${all[@]}"; do
+    m+="&tr=$(urlencode "$t")"
+  done
+  printf '%s' "$m"
+}
+
+# ---------------------------------------------------------------- sources ---
+cmd_torrent() {
+  need
+  local q="${1:-}" meta title="" kind idx row ih fi tr magnet nrows
+  if [ -n "$q" ] && [[ "$q" =~ ^tt[0-9]+$ ]]; then
+    R_ID="$q"; R_KIND="$TYPE"
+    meta=$(get "$CINEMETA/$TYPE/$R_ID.json" |
+      jq -r '.meta|[(.name//"?"),((.year//.releaseInfo//"----")|tostring)]|@tsv' 2>/dev/null)
+    title=$(printf '%s (%s)' "$(printf '%s' "$meta" | cut -f1)" "$(printf '%s' "$meta" | cut -f2)")
+  elif [ -n "$q" ]; then
+    resolve_title "$q"
+    meta=$(get "$CINEMETA/$R_KIND/$R_ID.json" |
+      jq -r '.meta|[(.name//"?"),((.year//.releaseInfo//"----")|tostring)]|@tsv' 2>/dev/null)
+    title=$(printf '%s (%s)' "$(printf '%s' "$meta" | cut -f1)" "$(printf '%s' "$meta" | cut -f2)")
+  else
+    die "give me a title or an IMDb id"
+  fi
+
+  kind="$R_KIND"
+  [ "${FORCE_TV:-0}" = "1" ] && kind="series"
+  [ "$kind" = "series" ] && ask_episode
+
+  local json rows
+  info "searching sources for $kind $R_ID${SEASON:+ S$SEASON E$EPISODE} ..."
+  json=$(torrentio_json "$kind" "$R_ID" "$SEASON" "$EPISODE") ||
+    { warn "no response from the source index"; return 1; }
+  rows=$(torrentio_rows "$json" "$QUALITY")
+  [ -n "$rows" ] || { warn "no sources (quality filter: ${QUALITY:-none}); try dropping -q"; return 1; }
+  rows=$(printf '%s\n' "$rows" | sort -t$'\t' -k1,1nr | head -25)
+
+  if ((LIST_ONLY)); then
+    printf '%s\n' "$rows" | awk -F'\t' -v t="${title:-$R_ID}" \
+      'BEGIN{print "  "t} { printf "  %-4s %s\n", NR".", $2 }'
+    return 0
+  fi
+
+  nrows=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+  if ((RANDOM_PICK)); then
+    idx=$(random_index "$nrows")
+  else
+    idx=$(printf '%s\n' "$rows" | cut -f2 |
+      pick_index "${title:-$R_ID} - pick a source:") || return 0
+  fi
+  row=$(printf '%s\n' "$rows" | sed -n "$((idx + 1))p")
+  ih=$(printf '%s' "$row" | cut -f3)
+  fi=$(printf '%s' "$row" | cut -f4)
+  tr=$(printf '%s' "$row" | cut -f5)
+  magnet=$(magnet_for "$ih" "$tr")
+
+  if [ -n "$RESOLVER_CMD" ]; then
+    local rurl
+    info "resolving via $RESOLVER_CMD"
+    rurl=$($RESOLVER_CMD "$kind" "$R_ID" "$SEASON" "$EPISODE" 2>/dev/null | head -1)
+    [ -n "$rurl" ] && { play_url "$rurl" "${title:-$R_ID}"; return $?; }
+    warn "resolver returned nothing, falling back to the torrent"
+  fi
+
+  subs_fetch "$kind" "$R_ID" "$SEASON" "$EPISODE" || true
+  # For movies, fileIdx 0 usually just means "largest file"; only pass it when
+  # Torrentio really pointed at a non-zero index.
+  local fsel="$fi"
+  [ "$kind" = "movie" ] && [ "$fsel" = "0" ] && fsel=""
+  play_magnet "$magnet" "${title:-$R_ID}" "$fsel"
+}
+
+cmd_iptv() {
+  need
+  local kw="${1:-}" file="$CACHE_DIR/iptv.m3u" rows total idx row url name grp
+  mkdir -p "$CACHE_DIR"
+  if [ ! -s "$file" ] || [ $(( $(date +%s) - $(stat -c %Y "$file" 2>/dev/null || echo 0) )) -gt 86400 ]; then
+    info "downloading channel list (once a day)"
+    get "$IPTV_URL" > "$file.tmp" && mv "$file.tmp" "$file"
+  fi
+  [ -s "$file" ] || die "could not download the channel list"
+
+  rows=$(awk '
+    { sub(/\r$/, "") }
+    /^#EXTINF/ {
+      line=$0; name=line; sub(/.*,[[:space:]]*/, "", name)
+      grp=""; if (match(line, /group-title="[^"]*"/)) grp=substr(line, RSTART+13, RLENGTH-14)
+      next
+    }
+    /^https?:\/\// { if (name!="") { printf "%s\t%s\t%s\n", grp, name, $0; name="" } }
+  ' "$file")
+
+  [ -n "$kw" ] && rows=$(printf '%s\n' "$rows" | grep -i -- "$kw")
+  [ -n "$rows" ] || die "no channels matched \"$kw\""
+
+  total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+  if ((LIST_ONLY)); then
+    printf '%s\n' "$rows" | head -60 |
+      awk -F'\t' '{ printf "  %-6s %-22s %s\n", NR".", $1, $2 }'
+    return 0
+  fi
+
+  if ((RANDOM_PICK)); then
+    idx=$(random_index "$total")
+  else
+    idx=$(printf '%s\n' "$rows" | awk -F'\t' '{ printf "%-20s %s\n", $1, $2 }' |
+      head -400 | pick_index "channels${kw:+ matching \"$kw\"} ($total total):") || return 0
+  fi
+
+  row=$(printf '%s\n' "$rows" | sed -n "$((idx + 1))p")
+  grp=$(printf '%s' "$row" | cut -f1)
+  name=$(printf '%s' "$row" | cut -f2)
+  url=$(printf '%s' "$row" | cut -f3)
+  [ -n "$url" ] || die "could not resolve that channel"
+  play_url "$url" "${grp:+[$grp] }$name"
+}
+
+cmd_archive() {
+  need
+  local kw="${1:-}" words q docs idx row ident files fname url nfiles fidx frow
+  [ -n "$kw" ] || die "usage: sss archive <keyword>"
+
+  words=$(printf '%s' "$kw" | sed 's/[^a-zA-Z0-9 ]/ /g' | xargs)
+  q="mediatype:movies AND title:($(printf '%s' "$words" | tr ' ' '\n' |
+    sed '/^$/d' | paste -sd' ' | sed 's/ / AND /g'))"
+
+  info "searching archive.org..."
+  docs=$(get "https://archive.org/advancedsearch.php?q=$(urlencode "$q")&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=year&fl%5B%5D=downloads&sort%5B%5D=downloads+desc&rows=25&page=1&output=json" |
+    jq -r '.response.docs[]? | [.identifier, (.year|tostring), (.downloads//0|tostring), (.title//"?")] | @tsv' 2>/dev/null)
+  docs=$(printf '%s\n' "$docs" | grep -viE 'trailer|teaser|sample|promo' || true)
+  [ -n "$docs" ] || die "nothing found for \"$kw\""
+
+  if ((LIST_ONLY)); then
+    printf '%s\n' "$docs" |
+      awk -F'\t' '{ printf "  %-6s %-6s %-9s %s\n", NR".", ($2=="null"?"----":$2), $3, $4 }'
+    return 0
+  fi
+
+  idx=$(printf '%s\n' "$docs" |
+    awk -F'\t' '{ printf "%-6s %9s dl  %s\n", ($2=="null"?"----":$2), $3, $4 }' |
+    pick_index "archive.org results:") || return 0
+  row=$(printf '%s\n' "$docs" | sed -n "$((idx + 1))p")
+  ident=$(printf '%s' "$row" | cut -f1)
+  [ -n "$ident" ] || die "could not resolve that pick"
+
+  info "reading files for $ident"
+  files=$(get "https://archive.org/metadata/$ident" |
+    jq -r '.files[]? | select(.name|test("\\.(mp4|mkv|webm|ogv|m4v)$";"i"))
+      | [(.name), (.size//"0"), (.format//"?")] | @tsv' 2>/dev/null |
+    sort -t$'\t' -k2,2nr)
+  [ -n "$files" ] || die "no video files in that item"
+
+  nfiles=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
+  if [ "$nfiles" -gt 1 ] && ((!RANDOM_PICK)); then
+    fidx=$(printf '%s\n' "$files" |
+      awk -F'\t' '{ printf "%8.1f MB  %s\n", $2/1048576, $1 }' |
+      pick_index "files:") || return 0
+    frow=$(printf '%s\n' "$files" | sed -n "$((fidx + 1))p")
+  elif ((RANDOM_PICK)); then
+    frow=$(printf '%s\n' "$files" | sed -n "$(( $(random_index "$nfiles") + 1 ))p")
+  else
+    frow=$(printf '%s\n' "$files" | head -1)
+  fi
+  fname=$(printf '%s' "$frow" | cut -f1)
+
+  url="https://archive.org/download/$ident/$(urlencode "$fname")"
+  ((LIST_ONLY)) && { printf '%s\n' "$url"; return 0; }
+  play_url "$url" "$ident"
+}
+
+# --------------------------------------------------------------- commands ---
+cmd_magnet() {
+  need
+  local m="${1:-}" title="${2:-torrent}" fidx="${3:-}"
+  [ -n "$m" ] || die "usage: sss magnet \"magnet:?xt=urn:btih:...\""
+  case "$m" in
+    magnet:*) ;;
+    *[!0-9a-fA-F]*) die "that is not a magnet link or infohash" ;;
+    *) m="magnet:?xt=urn:btih:$m" ;;
+  esac
+  play_magnet "$m" "$title" "$fidx"
+}
+
+cmd_url() {
+  need
+  local u="${1:-}"
+  [ -n "$u" ] || die "usage: sss url <url|file>   (m3u8, mp4, anything mpv opens)"
+  play_url "$u" "${2:-$(basename "${u%%\?*}")}"
+}
+
+cmd_setup() {
+  need
+  have python3 || die "python3 not found: install it first"
+  if ! python3 -c 'import libtorrent' 2>/dev/null; then
+    die "python3 libtorrent bindings missing:
+    Arch:      sudo pacman -S python-libtorrent libtorrent-rasterbar
+    Debian/Ub: sudo apt install python3-libtorrent
+    macOS:     brew install libtorrent-rasterbar  (then pip install libtorrent)"
+  fi
+  ok "python3 + libtorrent ready: $(python3 -c 'import libtorrent as lt; print(lt.__version__)')"
+  write_native_server || die "could not write native torrent server"
+  ok "native torrent server written to $NT_SERVER"
+}
+
+cmd_doctor() {
+  local t p
+  printf '%s%-12s %s%s\n' "$B" "tool" "status" "$R"
+  for t in bash curl jq python3 mpv ffplay; do
+    if have "$t"; then
+      printf '  %sOK%s   %-12s %s\n' "$GR" "$R" "$t" "$(command -v "$t")"
+    else
+      printf '  %s--%s   %-12s missing\n' "$YE" "$R" "$t"
+    fi
+  done
+  if python3 -c 'import libtorrent' 2>/dev/null; then
+    printf '  %sOK%s   %-12s libtorrent %s\n' "$GR" "$R" "libtorrent" "$(python3 -c 'import libtorrent as lt; print(lt.__version__)')"
+  else
+    printf '  %s--%s   %-12s missing (torrents will not play)\n' "$YE" "$R" "libtorrent"
+  fi
+  p=$(detect_player)
+  printf '  %s--%s   %-12s %s\n' "$D" "$R" "player" "$p"
+  echo
+  printf '  cache: %s\n' "$CACHE_DIR"
+  [ "$p" = "paper" ] && warn "no player found: sss will only print URLs"
+  printf '  note : ffplay cannot seek well or load subtitles; mpv can.\n'
+}
+
+cmd_selftest() {
+  need
+  local fails=0 n id
+  printf '%s1) IMDb search%s\n' "$B" "$R"
+  imdb_search "inception" | head -2 || fails=$((fails+1))
+  printf '%s2) source index (movie)%s\n' "$B" "$R"
+  n=$(torrentio_json movie tt1375666 | jq -r '.streams|length' 2>/dev/null || echo 0)
+  if [ "${n:-0}" -gt 0 ]; then ok "$n streams"; else warn "failed"; fails=$((fails+1)); fi
+  printf '%s3) source index (series)%s\n' "$B" "$R"
+  n=$(torrentio_json series tt0944947 1 1 | jq -r '.streams|length' 2>/dev/null || echo 0)
+  if [ "${n:-0}" -gt 0 ]; then ok "$n streams"; else warn "failed"; fails=$((fails+1)); fi
+  printf '%s4) subtitles%s\n' "$B" "$R"
+  n=$(get "$OPENSUBS/movie/tt1375666.json" | jq -r '.subtitles|length' 2>/dev/null || echo 0)
+  if [ "${n:-0}" -gt 0 ]; then ok "$n tracks"; else warn "failed"; fails=$((fails+1)); fi
+  printf '%s5) iptv%s\n' "$B" "$R"
+  mkdir -p "$CACHE_DIR"
+  get "$IPTV_URL" > "$CACHE_DIR/iptv.m3u"
+  n=$(grep -c '^#EXTINF' "$CACHE_DIR/iptv.m3u" 2>/dev/null || echo 0)
+  if [ "$n" -gt 100 ]; then ok "$n channels"; else warn "failed"; fails=$((fails+1)); fi
+  printf '%s6) archive.org%s\n' "$B" "$R"
+  id=$(get "https://archive.org/advancedsearch.php?q=collection%3Afeature_films+AND+mediatype%3Amovies&fl%5B%5D=identifier&rows=1&output=json" |
+    jq -r '.response.docs[0].identifier // empty')
+  if [ -n "$id" ]; then ok "ok ($id)"; else warn "failed"; fails=$((fails+1)); fi
+  printf '%s7) player%s\n' "$B" "$R"
+  printf '   %s\n' "$(detect_player)"
+  echo
+  if [ "$fails" -eq 0 ]; then ok "everything reachable"; else warn "$fails check(s) failed"; fi
+  return "$fails"
+}
+
+# ------------------------------------------------------------------- main ---
+main() {
+  local positional=()
+  while (($#)); do
+    case "$1" in
+      movie|tv|series|id|iptv|archive|magnet|url|doctor|setup|selftest|help)
+        CMD="$1"; shift ;;
+      -p|--player)    PLAYER="${2:?-p needs a value}"; shift 2 ;;
+      -q|--quality)   QUALITY="${2:?-q needs a value}"; shift 2 ;;
+      --subs)         SUBS_LANG="${2:?--subs needs a language}"; shift 2 ;;
+      --no-subs)      SUBS_LANG="off"; shift ;;
+      --tty)          TTY_MODE=1; shift ;;
+      --list)         LIST_ONLY=1; shift ;;
+      --random)       RANDOM_PICK=1; shift ;;
+      --resolver-cmd) RESOLVER_CMD="${2:?--resolver-cmd needs a value}"; shift 2 ;;
+      -h|--help)      usage; exit 0 ;;
+      -v|--version)   echo "sss $VERSION"; exit 0 ;;
+      --) shift; positional+=("$@"); break ;;
+      -*) die "unknown option: $1  (try --help)" ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+
+  case "$CMD" in
+    help)     usage; exit 0 ;;
+    doctor)   cmd_doctor; exit 0 ;;
+    setup)    cmd_setup; exit $? ;;
+    selftest) cmd_selftest; exit $? ;;
+    iptv)     cmd_iptv "${positional[0]:-}"; exit $? ;;
+    archive)  cmd_archive "${positional[0]:-}"; exit $? ;;
+    magnet)   cmd_magnet "${positional[0]:-}" "${positional[1]:-}"; exit $? ;;
+    url)      cmd_url "${positional[0]:-}"; exit $? ;;
+    id)
+      [ -n "${positional[0]:-}" ] || die "usage: sss id tt1234567 [season episode]"
+      FORCE_TV="$([ -n "${positional[1]:-}" ] && echo 1 || echo 0)"
+      SEASON="${positional[1]:-}"; EPISODE="${positional[2]:-}"
+      cmd_torrent "${positional[0]}"; exit $? ;;
+    movie)    TYPE="movie"; cmd_torrent "${positional[0]:-}"; exit $? ;;
+    tv|series)
+      TYPE="series"; FORCE_TV=1
+      SEASON="${positional[1]:-}"; EPISODE="${positional[2]:-}"
+      cmd_torrent "${positional[0]:-}"; exit $? ;;
+    "")
+      [ "${#positional[@]}" -gt 0 ] || { usage; exit 1; }
+      cmd_torrent "${positional[0]}"; exit $? ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"

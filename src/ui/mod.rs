@@ -342,20 +342,21 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ("q / Esc", "Back to Search"),
         ],
         Screen::SeasonEpisode => vec![
+            ("Enter", "⚡ Instant Play"),
+            ("v", "Browse Sources"),
             ("←/→", "Adjust Value"),
-            ("Tab / ↑/↓", "Switch Field"),
-            ("0-9", "Type"),
-            ("Enter", "Fetch Sources"),
+            ("Tab", "Switch Field"),
             ("q / Esc", "Back"),
         ],
         Screen::PickSource => {
             let is_series = app.selected_show().is_some_and(|s| s.is_series());
             let mut p = vec![
                 ("↑/↓, j/k", "Navigate"),
+                ("Enter", "Stream MPV"),
+                ("s", "Sort (★)"),
+                ("e", "Dubs"),
                 ("Tab/f", "Quality"),
                 ("p", "Provider"),
-                ("s", "Sort"),
-                ("Enter", "Stream MPV"),
             ];
             if is_series {
                 p.push(("n/p", "Next/Prev Ep"));
@@ -373,19 +374,20 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ("Esc", "Clear"),
         ],
         Screen::AnimeEpisode => vec![
+            ("Enter", "⚡ Instant Play"),
+            ("v", "Browse Sources"),
             ("←/→, -/+", "Adjust Ep"),
-            ("0-9", "Type Ep"),
-            ("Enter", "Fetch Sources"),
             ("q / Esc", "Back"),
         ],
         Screen::AnimeSources => {
             let is_movie = app.selected_anime().is_some_and(|a| a.is_movie());
             let mut p = vec![
                 ("↑/↓, j/k", "Navigate"),
+                ("Enter", "Stream MPV"),
+                ("s", "Sort (★)"),
+                ("e", "Dubs"),
                 ("Tab/f", "Quality"),
                 ("p", "Provider"),
-                ("s", "Sort"),
-                ("Enter", "Stream MPV"),
             ];
             if !is_movie {
                 p.push(("n/P", "Next/Prev Ep"));
@@ -403,20 +405,21 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ("Esc", "Clear"),
         ],
         Screen::CartoonSeasonEpisode => vec![
+            ("Enter", "⚡ Instant Play"),
+            ("v", "Browse Sources"),
             ("←/→", "Adjust Value"),
-            ("Tab / ↑/↓", "Switch Field"),
-            ("0-9", "Type"),
-            ("Enter", "Fetch Sources"),
+            ("Tab", "Switch Field"),
             ("q / Esc", "Back"),
         ],
         Screen::CartoonSources => {
             let is_series = app.selected_cartoon().is_some_and(|c| c.is_series);
             let mut p = vec![
                 ("↑/↓, j/k", "Navigate"),
+                ("Enter", "Stream MPV"),
+                ("s", "Sort (★)"),
+                ("e", "Dubs"),
                 ("Tab/f", "Quality"),
                 ("p", "Provider"),
-                ("s", "Sort"),
-                ("Enter", "Stream MPV"),
             ];
             if is_series {
                 p.push(("n/P", "Next/Prev Ep"));
@@ -842,8 +845,10 @@ fn render_season_episode_screen(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("Type Number"),
         ]),
         Line::from(vec![
-            Span::styled("[Enter] ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("Fetch Sources     "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Green).bold()),
+            Span::styled("⚡ Instant Play (Auto-Best)    ", Style::default().fg(Color::Green).bold()),
+            Span::styled("[v] ", Style::default().fg(Color::Yellow).bold()),
+            Span::styled("Browse Sources    ", Style::default().fg(Color::Yellow)),
             Span::styled("[q / Esc] ", Style::default().fg(Color::DarkGray)),
             Span::raw("Back"),
         ]),
@@ -899,6 +904,17 @@ fn render_pick_source_screen(f: &mut Frame, app: &App, area: Rect) {
     filter_spans.push(Span::styled(
         format!(" [{}] ", app.sort_order.label()),
         Style::default().fg(Color::Green).bold(),
+    ));
+
+    filter_spans.push(Span::raw(" │ "));
+    filter_spans.push(Span::styled(" Dubs [e]: ", Style::default().fg(Color::DarkGray)));
+    filter_spans.push(Span::styled(
+        if app.hide_foreign_dubs { " [Hide] " } else { " [Show] " },
+        if app.hide_foreign_dubs {
+            Style::default().fg(Color::Green).bold()
+        } else {
+            Style::default().fg(Color::Yellow).bold()
+        },
     ));
 
     let filter_bar = Paragraph::new(Line::from(filter_spans))
@@ -964,6 +980,21 @@ fn render_pick_source_screen(f: &mut Frame, app: &App, area: Rect) {
             let item = &app.sources[actual_idx];
             let num_span = Span::styled(format!("{:2}. ", display_idx + 1), Style::default().fg(Color::DarkGray));
 
+            let recom_span = if display_idx == 0 {
+                Span::styled("★ TOP ", Style::default().fg(Color::Yellow).bold())
+            } else {
+                Span::raw("      ")
+            };
+
+            let (h_tag, _) = item.health().badge();
+            let h_span = match item.health() {
+                crate::models::StreamHealth::Instant => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Green).bold()),
+                crate::models::StreamHealth::Good => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Green)),
+                crate::models::StreamHealth::Fair => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Yellow)),
+                crate::models::StreamHealth::Slow => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Rgb(255, 165, 0))),
+                crate::models::StreamHealth::Stalled => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Red)),
+            };
+
             // Provider badge
             let (p_label, p_style) = if item.provider.contains('+') {
                 ("[MULTI] ", Style::default().fg(Color::Yellow).bold())
@@ -998,10 +1029,17 @@ fn render_pick_source_screen(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let size_span = Span::styled(format!("{:8} ", item.size_str), Style::default().fg(Color::Cyan));
+
+            let dub_span = if item.is_foreign_dub_only() {
+                Span::styled("[Dub] ", Style::default().fg(Color::Rgb(255, 100, 100)))
+            } else {
+                Span::raw("")
+            };
+
             let title_span = Span::styled(&item.title, Style::default().fg(Color::White));
 
             ListItem::new(Line::from(vec![
-                num_span, provider_span, res_span, seeds_span, size_span, title_span,
+                num_span, recom_span, h_span, provider_span, res_span, seeds_span, size_span, dub_span, title_span,
             ]))
         })
         .collect();
@@ -1069,23 +1107,39 @@ fn render_pick_source_screen(f: &mut Frame, app: &App, area: Rect) {
             let lines = vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Resolution:  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Stream Health: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{} (Score: {} pts)", item.health().badge().0, item.smart_score()), Style::default().fg(Color::Yellow).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Swarm Buffer:  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(item.health().badge().1, Style::default().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Audio / Dub:   ", Style::default().fg(Color::DarkGray)),
+                    if item.is_foreign_dub_only() {
+                        Span::styled("⚠️ Foreign Dub Only (Non-English)", Style::default().fg(Color::Red).bold())
+                    } else {
+                        Span::styled("✓ English / Multi-Audio Verified", Style::default().fg(Color::Green).bold())
+                    },
+                ]),
+                Line::from(vec![
+                    Span::styled("Resolution:    ", Style::default().fg(Color::DarkGray)),
                     Span::styled(quality_text, Style::default().fg(Color::Green).bold()),
                 ]),
                 Line::from(vec![
-                    Span::styled("Video Codec: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Video Codec:   ", Style::default().fg(Color::DarkGray)),
                     Span::styled(codec_text, Style::default().fg(Color::Cyan)),
                 ]),
                 Line::from(vec![
-                    Span::styled("P2P Health:  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("P2P Health:    ", Style::default().fg(Color::DarkGray)),
                     Span::styled(seeds_text, Style::default().fg(Color::Yellow)),
                 ]),
                 Line::from(vec![
-                    Span::styled("File Size:   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("File Size:     ", Style::default().fg(Color::DarkGray)),
                     Span::styled(&item.size_str, Style::default().fg(Color::Cyan)),
                 ]),
                 Line::from(vec![
-                    Span::styled("Provider:    ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Provider:      ", Style::default().fg(Color::DarkGray)),
                     Span::styled(&item.provider, Style::default().fg(Color::Magenta).bold()),
                 ]),
                 Line::from(""),
@@ -1096,7 +1150,7 @@ fn render_pick_source_screen(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(Span::styled("Player:    MPV / HW Acceleration (libtorrent HTTP daemon)", Style::default().fg(Color::DarkGray))),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "▶ Press [Enter] to stream directly",
+                    "▶ Press [Enter] to stream directly (with auto-failover)",
                     Style::default().fg(Color::Cyan).bold(),
                 )),
             ];
@@ -1427,8 +1481,10 @@ fn render_anime_episode_screen(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("[Enter] ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("Fetch Anime Sources     "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Green).bold()),
+            Span::styled("⚡ Instant Play (Auto-Best)    ", Style::default().fg(Color::Green).bold()),
+            Span::styled("[v] ", Style::default().fg(Color::Yellow).bold()),
+            Span::styled("Browse Sources    ", Style::default().fg(Color::Yellow)),
             Span::styled("[q / Esc] ", Style::default().fg(Color::DarkGray)),
             Span::raw("Back to Anime List"),
         ]),
@@ -1483,6 +1539,17 @@ fn render_anime_sources_screen(f: &mut Frame, app: &App, area: Rect) {
     filter_spans.push(Span::styled(
         format!(" [{}] ", app.anime_sort_order.label()),
         Style::default().fg(Color::Green).bold(),
+    ));
+
+    filter_spans.push(Span::raw(" │ "));
+    filter_spans.push(Span::styled(" Dubs [e]: ", Style::default().fg(Color::DarkGray)));
+    filter_spans.push(Span::styled(
+        if app.hide_foreign_dubs { " [Hide] " } else { " [Show] " },
+        if app.hide_foreign_dubs {
+            Style::default().fg(Color::Green).bold()
+        } else {
+            Style::default().fg(Color::Yellow).bold()
+        },
     ));
 
     let filter_bar = Paragraph::new(Line::from(filter_spans))
@@ -1547,6 +1614,21 @@ fn render_anime_sources_screen(f: &mut Frame, app: &App, area: Rect) {
             let s = &app.anime_sources[actual_idx];
             let num_span = Span::styled(format!("{:2}. ", display_idx + 1), Style::default().fg(Color::DarkGray));
 
+            let recom_span = if display_idx == 0 {
+                Span::styled("★ TOP ", Style::default().fg(Color::Yellow).bold())
+            } else {
+                Span::raw("      ")
+            };
+
+            let (h_tag, _) = s.health().badge();
+            let h_span = match s.health() {
+                crate::models::StreamHealth::Instant => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Green).bold()),
+                crate::models::StreamHealth::Good => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Green)),
+                crate::models::StreamHealth::Fair => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Yellow)),
+                crate::models::StreamHealth::Slow => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Rgb(255, 165, 0))),
+                crate::models::StreamHealth::Stalled => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Red)),
+            };
+
             let res_style = match s.resolution.as_str() {
                 "4K" => Style::default().fg(Color::Black).bg(Color::Magenta).bold(),
                 "1080p" => Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
@@ -1566,13 +1648,23 @@ fn render_anime_sources_screen(f: &mut Frame, app: &App, area: Rect) {
             let seeds_span = Span::styled(format!(" 👤{:>3} ", seeds_val), seeds_style);
 
             let size_span = Span::styled(format!(" 💾{:>8} ", s.size_str), Style::default().fg(Color::Gray));
+
+            let dub_span = if s.is_foreign_dub_only() {
+                Span::styled(" [Dub] ", Style::default().fg(Color::Rgb(255, 100, 100)))
+            } else {
+                Span::raw("")
+            };
+
             let title_span = Span::styled(&s.title, Style::default().fg(Color::White));
 
             ListItem::new(Line::from(vec![
                 num_span,
+                recom_span,
+                h_span,
                 res_span,
                 seeds_span,
                 size_span,
+                dub_span,
                 title_span,
             ]))
         })
@@ -2044,8 +2136,10 @@ fn render_cartoon_season_episode_screen(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("[Enter] ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw("Fetch Cartoon Sources     "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Green).bold()),
+            Span::styled("⚡ Instant Play (Auto-Best)    ", Style::default().fg(Color::Green).bold()),
+            Span::styled("[v] ", Style::default().fg(Color::Yellow).bold()),
+            Span::styled("Browse Sources    ", Style::default().fg(Color::Yellow)),
             Span::styled("[q / Esc] ", Style::default().fg(Color::DarkGray)),
             Span::raw("Back to Cartoon List"),
         ]),
@@ -2100,6 +2194,17 @@ fn render_cartoon_sources_screen(f: &mut Frame, app: &App, area: Rect) {
     filter_spans.push(Span::styled(
         format!(" [{}] ", app.cartoon_sort_order.label()),
         Style::default().fg(Color::Green).bold(),
+    ));
+
+    filter_spans.push(Span::raw(" │ "));
+    filter_spans.push(Span::styled(" Dubs [e]: ", Style::default().fg(Color::DarkGray)));
+    filter_spans.push(Span::styled(
+        if app.hide_foreign_dubs { " [Hide] " } else { " [Show] " },
+        if app.hide_foreign_dubs {
+            Style::default().fg(Color::Green).bold()
+        } else {
+            Style::default().fg(Color::Yellow).bold()
+        },
     ));
 
     let filter_bar = Paragraph::new(Line::from(filter_spans))
@@ -2164,6 +2269,21 @@ fn render_cartoon_sources_screen(f: &mut Frame, app: &App, area: Rect) {
             let s = &app.cartoon_sources[actual_idx];
             let num_span = Span::styled(format!("{:2}. ", display_idx + 1), Style::default().fg(Color::DarkGray));
 
+            let recom_span = if display_idx == 0 {
+                Span::styled("★ TOP ", Style::default().fg(Color::Yellow).bold())
+            } else {
+                Span::raw("      ")
+            };
+
+            let (h_tag, _) = s.health().badge();
+            let h_span = match s.health() {
+                crate::models::StreamHealth::Instant => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Green).bold()),
+                crate::models::StreamHealth::Good => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Green)),
+                crate::models::StreamHealth::Fair => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Yellow)),
+                crate::models::StreamHealth::Slow => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Rgb(255, 165, 0))),
+                crate::models::StreamHealth::Stalled => Span::styled(format!("{h_tag:10} "), Style::default().fg(Color::Red)),
+            };
+
             let res_style = match s.resolution.as_str() {
                 "4K" => Style::default().fg(Color::Black).bg(Color::Magenta).bold(),
                 "1080p" => Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
@@ -2183,13 +2303,23 @@ fn render_cartoon_sources_screen(f: &mut Frame, app: &App, area: Rect) {
             let seeds_span = Span::styled(format!(" 👤{:>3} ", seeds_val), seeds_style);
 
             let size_span = Span::styled(format!(" 💾{:>8} ", s.size_str), Style::default().fg(Color::Gray));
+
+            let dub_span = if s.is_foreign_dub_only() {
+                Span::styled(" [Dub] ", Style::default().fg(Color::Rgb(255, 100, 100)))
+            } else {
+                Span::raw("")
+            };
+
             let title_span = Span::styled(&s.title, Style::default().fg(Color::White));
 
             ListItem::new(Line::from(vec![
                 num_span,
+                recom_span,
+                h_span,
                 res_span,
                 seeds_span,
                 size_span,
+                dub_span,
                 title_span,
             ]))
         })
